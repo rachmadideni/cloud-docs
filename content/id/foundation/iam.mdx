@@ -1,3 +1,226 @@
 # IAM & Identity
 
-> Placeholder — segera ditulis. Akan cover: principle of least privilege, role vs user, assume role, policy structure, cross-provider mapping.
+**TL;DR**: IAM jawab pertanyaan: "Siapa boleh ngapain ke apa, kapan". Sebelum service AWS lain bisa kerja, kamu harus paham 4 kata ini: principal, action, resource, policy.
+
+## Mental model
+
+Bayangkan AWS sebagai gedung kantor besar dengan ribuan ruangan (service). Setiap orang yang masuk harus punya kartu akses. Kartu menentukan ruangan mana boleh dimasuki dan kegiatan apa boleh dilakukan di sana.
+
+IAM adalah sistem kartu akses itu. Bukan firewall, bukan login user app kamu, bukan SSL. Murni soal otorisasi internal antar entitas AWS.
+
+## Empat kata yang harus diingat
+
+| Kata | Arti | Contoh |
+|---|---|---|
+| **Principal** | siapa yang request | user `alice`, role `lambda-exec`, service `lambda.amazonaws.com` |
+| **Action** | apa yang dilakukan | `s3:GetObject`, `dynamodb:PutItem`, `lambda:InvokeFunction` |
+| **Resource** | objek target | `arn:aws:s3:::my-bucket/photos/*` |
+| **Condition** | syarat tambahan (opsional) | request harus dari IP tertentu, MFA aktif, waktu kerja |
+
+Setiap request ke AWS dievaluasi: principal X minta action Y ke resource Z dengan condition W. IAM bilang Allow atau Deny.
+
+## Policy: format JSON
+
+Policy adalah dokumen JSON yang nyatakan rule di atas dalam bentuk machine-readable.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Effect": "Allow",
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::my-app-uploads/*"
+    }
+  ]
+}
+```
+
+Terjemahan: izinkan baca tulis file di bucket `my-app-uploads`. Bukan list bucket, bukan delete, bukan bucket lain.
+
+Statement bisa lebih dari satu. Bisa juga Deny eksplisit (Deny menang dari Allow kalau dua-duanya kena).
+
+### ARN: format identitas resource
+
+Semua resource AWS punya ARN (Amazon Resource Name). Format:
+
+```
+arn:aws:<service>:<region>:<account-id>:<resource>
+```
+
+Contoh:
+- `arn:aws:s3:::my-bucket` (S3 bucket, region dan account kosong karena global)
+- `arn:aws:s3:::my-bucket/folder/*` (semua object dalam folder)
+- `arn:aws:lambda:ap-southeast-3:123456789012:function:notes-api` (Lambda di Jakarta)
+- `arn:aws:dynamodb:us-east-1:123456789012:table/Users` (DynamoDB table)
+
+Wildcard `*` valid di akhir resource. Bisa juga di action: `s3:*` artinya semua action S3.
+
+## User vs Role vs Group
+
+Tiga jenis principal yang sering dipakai. Beda fundamental.
+
+### User
+
+Identitas long-term untuk manusia atau aplikasi external. Punya:
+- Access key + secret (untuk programmatic akses)
+- Password (untuk console login)
+- Optional MFA
+
+Contoh: developer team kamu masing-masing punya user.
+
+**Hindari user untuk aplikasi yang jalan di AWS.** Selalu pakai role.
+
+### Role
+
+Identitas tanpa credential permanent. Di-assume sementara oleh principal lain, menghasilkan credential temporary (default 1 jam) via STS.
+
+Contoh:
+- Lambda function meng-assume role saat eksekusi, untuk akses DynamoDB
+- EC2 instance meng-assume role via instance profile, untuk akses S3
+- Developer dari akun A meng-assume role di akun B (cross-account)
+
+**Selalu prefer role kalau bisa.** Tidak ada credential di disk, rotation otomatis, audit lebih jelas.
+
+### Group
+
+Bukan principal. Cuma container untuk user, biar policy bisa di-attach ke banyak user sekaligus.
+
+Contoh: group `developers` punya policy read-only ke production. Tambah user ke group, policy itu langsung berlaku.
+
+## Policy: identity-based vs resource-based vs trust
+
+Tiga tempat policy bisa nempel. Beda peran.
+
+### Identity-based policy
+
+Nempel di user, role, atau group. Jawab: "principal ini boleh ngapain?".
+
+```json
+{
+  "Effect": "Allow",
+  "Action": "dynamodb:Query",
+  "Resource": "arn:aws:dynamodb:*:*:table/Notes"
+}
+```
+
+### Resource-based policy
+
+Nempel di resource. Jawab: "siapa boleh akses resource ini?". Tidak semua service support, yang paling sering: S3 bucket policy, Lambda function policy, SNS topic policy.
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::123456789012:user/alice" },
+  "Action": "s3:GetObject",
+  "Resource": "arn:aws:s3:::my-bucket/*"
+}
+```
+
+### Trust policy
+
+Khusus untuk role. Jawab: "siapa boleh meng-assume role ini?".
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": { "Service": "lambda.amazonaws.com" },
+    "Action": "sts:AssumeRole"
+  }]
+}
+```
+
+Trust policy di atas bilang: Lambda service boleh assume role ini. Dipakai untuk Lambda execution role.
+
+## Pattern umum
+
+### 1. Lambda execution role
+
+Lambda function butuh role yang trust policy-nya allow `lambda.amazonaws.com`. Role itu di-attach identity policy untuk akses resource yang dibutuhkan (DynamoDB, S3, dll).
+
+Saat function jalan, AWS otomatis kasih temporary credentials sesuai role itu ke runtime. Code kamu pakai SDK biasa, SDK auto-pickup credentials dari env.
+
+### 2. EC2 instance profile
+
+EC2 yang butuh akses AWS service tidak perlu naro access key di disk. Bikin role dengan trust ke `ec2.amazonaws.com`, attach ke instance via instance profile. SDK di dalam EC2 ambil credential dari instance metadata service (IMDS).
+
+### 3. Cross-account access
+
+Punya 2 akun: `prod` dan `staging`. Developer di `staging` butuh akses tertentu ke resource di `prod`.
+
+Setup:
+- Di `prod`: bikin role `staging-read`, trust policy allow root principal `arn:aws:iam::<staging-account-id>:root`. Identity policy: read-only ke resource yang dibolehkan.
+- Di `staging`: developer assume role via `sts:AssumeRole` ke ARN role di prod. Dapat temporary credentials prod selama 1 jam.
+
+Tidak ada user atau credential prod yang bocor.
+
+### 4. IRSA (IAM Roles for Service Accounts)
+
+Khusus EKS (Kubernetes di AWS). Pod di K8s di-assign IAM role lewat service account, tanpa naro credential di pod. Equivalent dari instance profile, tapi level pod bukan node.
+
+## Prinsip least privilege
+
+Berikan izin minimal yang dibutuhkan, bukan lebih.
+
+**Salah** (managed policy terlalu lebar):
+
+```bash
+aws iam attach-role-policy \
+  --policy-arn arn:aws:iam::aws:policy/AmazonDynamoDBFullAccess
+```
+
+`FullAccess` artinya bisa drop table, bikin table baru, di akun manapun. Lambda yang cuma butuh `GetItem` dan `PutItem` ke satu table tidak butuh ini.
+
+**Benar** (custom policy scope spesifik):
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Action": ["dynamodb:GetItem", "dynamodb:PutItem"],
+    "Resource": "arn:aws:dynamodb:ap-southeast-3:123456789012:table/Notes"
+  }]
+}
+```
+
+Cuma 2 action, cuma 1 table. Kalau function di-compromise, blast radius kecil.
+
+Trade-off: lebih banyak policy yang harus dimaintain. Worth it untuk produksi.
+
+## Local emulator
+
+Floci support penuh IAM dengan 68+ operasi. Bisa bikin user, role, attach policy, assume role, semua sama persis dengan AWS asli.
+
+Bedanya: validation policy di Floci longgar. Policy yang invalid di AWS asli kadang accepted di Floci. Jangan jadikan Floci sebagai satu-satunya test untuk policy production. Test policy dengan IAM Policy Simulator atau via dry-run di staging account.
+
+Account ID di Floci selalu `000000000000`. Di AWS asli, account ID 12-digit unik per akun.
+
+## Gotcha
+
+- **Eventually consistent**: bikin user atau policy bisa butuh beberapa detik untuk propagate. Kalau langsung pakai dan kena `AccessDenied`, tunggu 5-10 detik retry.
+- **Deny menang**: Allow di satu policy + Deny eksplisit di policy lain = hasil Deny. Berguna untuk safety net (mis. SCP di organization).
+- **Service-linked role**: beberapa service auto-bikin role untuk dirinya sendiri (mis. ECS, EKS). Jangan delete, service akan rusak.
+- **Root user vs IAM user**: root user adalah email yang sign up akun. Jangan dipakai sehari-hari. Bikin IAM user pertama dengan admin policy, simpan kredensial root di tempat aman, lupakan.
+- **MFA wajib untuk root**. Enable hari pertama. Tanpa MFA, root account adalah single point of catastrophe.
+- **Access key di repo**: paling sering breach. Jangan commit `~/.aws/credentials`. Jangan hardcode `accessKey: 'AKIA...'` di code. Pakai role atau env var.
+- **Wildcard di action lebih bahaya dari wildcard di resource**: `s3:*` di resource spesifik berarti semua action ke 1 bucket. Tapi `*:*` ke semua resource = god mode. Hindari.
+- **Policy size limit**: managed policy max 6144 character, inline policy max 2048 untuk user, 10240 untuk role. Kalau policy makin besar, pecah jadi beberapa managed policy.
+
+## Cross-provider
+
+| Provider | Equivalent | Konsep beda |
+|---|---|---|
+| Azure | Entra ID + RBAC | Role assignment di scope (subscription/resource group/resource). Tidak ada concept "role assume", pakai managed identity. |
+| GCP | Cloud IAM | Bind member ke role di resource. Service account adalah "user" untuk aplikasi. |
+| Oracle | OCI IAM | Mirip AWS, ada user, group, policy. Policy syntax beda (statement-based language, bukan JSON). |
+
+Pola "principal + action + resource" universal. Detail syntax dan ergonomic beda.
+
+## Belajar lebih lanjut
+
+- [AWS IAM Policy Simulator](https://policysim.aws.amazon.com) untuk test policy tanpa apply.
+- `aws iam get-account-authorization-details` untuk dump semua policy di akun (audit).
+- Tool: `cloudsplaining` (Salesforce open source) untuk scan policy yang terlalu permisif.
