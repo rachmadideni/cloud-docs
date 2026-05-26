@@ -5,5 +5,6 @@ export default {
   'j3-auth': 'J3 — Auth & User Management',
   'j4-file-upload': 'J4 — File Upload Pipeline',
   'j5-event-driven': 'J5 — Event-Driven Backend',
-  'j6-relational': 'J6 — Relational App'
+  'j6-relational': 'J6 — Relational App',
+  'j7-data-pipeline': 'J7 — Data Pipeline'
 }
