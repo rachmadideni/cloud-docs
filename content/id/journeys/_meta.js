@@ -4,5 +4,6 @@ export default {
   'j2-rest-api': 'J2 — REST API Serverless',
   'j3-auth': 'J3 — Auth & User Management',
   'j4-file-upload': 'J4 — File Upload Pipeline',
-  'j5-event-driven': 'J5 — Event-Driven Backend'
+  'j5-event-driven': 'J5 — Event-Driven Backend',
+  'j6-relational': 'J6 — Relational App'
 }
