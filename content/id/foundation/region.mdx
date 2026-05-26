@@ -1,0 +1,154 @@
+# Region & Availability Zone
+
+**TL;DR**: AWS bukan satu super-komputer raksasa. Infrastrukturnya tersebar di puluhan lokasi fisik. Region adalah lokasi geografis (kota), AZ adalah data center independen di dalam region itu (gedung). Pemilihan region menentukan latency, harga, dan service apa yang tersedia.
+
+## Mental model
+
+Bayangkan AWS punya kantor cabang di kota-kota besar dunia. Setiap kota disebut region. Di tiap kota, AWS sewa minimal 3 gedung yang punya listrik, internet, dan pendingin terpisah. Tiap gedung itu adalah AZ.
+
+Aplikasi kamu hidup di salah satu region. Resource kamu (server, database, file) tinggal di salah satu AZ di region itu, atau direplikasi ke beberapa AZ.
+
+## Region
+
+Region adalah area geografis dengan kode pendek.
+
+| Kode | Lokasi | Catatan |
+|---|---|---|
+| `us-east-1` | N. Virginia | region tertua, paling lengkap service-nya, paling sering dipakai default |
+| `us-west-2` | Oregon | populer untuk west coast US |
+| `eu-west-1` | Ireland | hub Eropa |
+| `eu-central-1` | Frankfurt | data residency Jerman |
+| `ap-southeast-1` | Singapore | terdekat dari Indonesia secara historis |
+| `ap-southeast-3` | **Jakarta** | region Indonesia, launch 2021 |
+| `ap-northeast-1` | Tokyo | hub Asia Pasifik |
+
+Daftar lengkap ada di [AWS Regional Services](https://aws.amazon.com/about-aws/global-infrastructure/regional-product-services/). Per 2026 ada 30+ region public, plus region khusus government dan China.
+
+### Cara memilih region
+
+Empat kriteria, urut prioritas:
+
+1. **Compliance / data residency**. Kalau regulasi minta data tetap di Indonesia, pilih `ap-southeast-3`. Non-negotiable.
+2. **Latency ke user**. User di Jakarta akses `us-east-1` kena 250+ ms round-trip. Akses `ap-southeast-3` di bawah 10 ms. Test pakai [CloudPing.cloud](https://www.cloudping.cloud/) dari device user.
+3. **Service availability**. Tidak semua region punya semua service. Bedrock, SageMaker fitur baru sering launch di `us-east-1` dulu, region lain menyusul berbulan-bulan kemudian.
+4. **Harga**. Antar-region beda harga. `us-east-1` paling murah untuk kebanyakan service. Jakarta lebih mahal sekitar 10-20% dari Virginia.
+
+Untuk user Indonesia: default ke `ap-southeast-3`. Kalau service yang dibutuhkan tidak tersedia di sana, pilih `ap-southeast-1` (Singapore) sebagai backup terdekat.
+
+## Availability Zone (AZ)
+
+Tiap region punya minimal 3 AZ (beberapa region punya 6). Kode AZ: region + huruf.
+
+```
+ap-southeast-3a
+ap-southeast-3b
+ap-southeast-3c
+```
+
+Tiap AZ adalah satu atau lebih data center fisik yang:
+- Punya supply listrik independen
+- Punya backbone network independen
+- Punya cooling system independen
+- Lokasi fisik puluhan km terpisah dari AZ lain di region yang sama
+
+Tujuannya: kalau satu AZ down (kebakaran, banjir, gempa), AZ lain di region yang sama tetap hidup.
+
+### Hati-hati: huruf AZ tidak universal
+
+Akun A `ap-southeast-3a` belum tentu data center yang sama dengan akun B `ap-southeast-3a`. AWS shuffle huruf antar akun untuk load balancing. Kalau perlu identifier konsisten, pakai AZ ID (`apse3-az1`) lewat `aws ec2 describe-availability-zones`.
+
+## Service scope: global vs regional vs zonal
+
+Tidak semua service tinggal di satu tempat yang sama.
+
+### Global
+
+Service yang tidak terikat region. Resource-nya unik di seluruh dunia per akun.
+
+- **IAM**: user, role, policy. Bikin role sekali, berlaku di semua region.
+- **Route53**: DNS service, edge location global.
+- **CloudFront**: CDN, edge location global.
+- **S3**: bucket name unik global, walau data fisik tersimpan di region pilihan.
+- **WAF (untuk CloudFront)**: harus dibuat di `us-east-1` walau CloudFront global.
+
+### Regional
+
+Resource hidup di satu region. Tidak otomatis available di region lain.
+
+- **EC2**: instance ada di region tertentu, di AZ tertentu.
+- **RDS, DynamoDB**: database per region. DynamoDB punya fitur Global Tables untuk multi-region.
+- **Lambda, API Gateway**: function dan API per region.
+- **VPC**: virtual network per region.
+- **SQS, SNS, EventBridge**: messaging per region.
+
+Bikin Lambda di `ap-southeast-3` artinya function itu cuma ada di Jakarta. Untuk available di Singapore, deploy ulang ke `ap-southeast-1`.
+
+### Zonal (AZ-scoped)
+
+Resource hidup di satu AZ spesifik. Kalau AZ itu down, resource itu unreachable.
+
+- **EC2 instance**: launch ke AZ tertentu.
+- **EBS volume**: attach ke instance di AZ yang sama. Tidak bisa cross-AZ.
+- **RDS instance**: primary di satu AZ, standby di AZ lain (Multi-AZ feature).
+
+Untuk high availability, distribute resource ke beberapa AZ. ALB, ASG, EKS otomatis cross-AZ kalau di-config.
+
+## VPC dan AZ
+
+VPC (Virtual Private Cloud) hidup di satu region. Di dalam VPC, kamu bikin subnet. Setiap subnet terikat ke satu AZ.
+
+```
+VPC (region: ap-southeast-3)
+├── subnet-1a (ap-southeast-3a, 10.0.1.0/24)
+├── subnet-1b (ap-southeast-3b, 10.0.2.0/24)
+└── subnet-1c (ap-southeast-3c, 10.0.3.0/24)
+```
+
+Bikin EC2 di subnet-1a artinya instance itu di AZ `ap-southeast-3a`. Untuk multi-AZ deployment, ada minimal 1 subnet per AZ yang dipakai.
+
+## Cross-region replication
+
+Kalau butuh disaster recovery atau global latency, replikasi resource ke region lain.
+
+| Service | Cara replikasi |
+|---|---|
+| S3 | Cross-Region Replication (CRR), async, bucket-to-bucket |
+| DynamoDB | Global Tables, multi-region active-active |
+| RDS | Read replica cross-region, async |
+| Aurora | Global Database, primary 1 region + read replica di 5 region lain |
+| KMS | Multi-Region Keys |
+
+Cost diperhitungkan: bayar storage di kedua region + bayar transfer data (egress). Egress antar-region tidak gratis.
+
+## Floci coverage
+
+Floci emulator pakai default region `us-east-1`. Tidak ada konsep multi-region atau multi-AZ. Resource tinggal di satu space ephemeral.
+
+Untuk test logic multi-region (misal app yang failover ke region lain), Floci tidak cocok. Pakai dua container Floci dengan endpoint berbeda sebagai workaround, atau test di staging account AWS asli.
+
+## Gotcha
+
+- **Account ID 12-digit global**. Sama di semua region. Resource ARN-nya yang beda per region.
+- **ACM cert untuk CloudFront harus di `us-east-1`**. Hard requirement, tidak peduli CloudFront kamu serve user mana. Untuk service lain (ALB, API Gateway), cert di region resource.
+- **Service quota per region**. Kuota Lambda concurrent execution 1000 di tiap region. Pakai Jakarta plus Singapore = kuota 2000 total, tidak share.
+- **Free tier per akun, bukan per region**. 100k Lambda request gratis = 100k total, bukan per region.
+- **Pricing per region**. Halaman pricing AWS punya region selector. Hitung biaya pakai region tujuan, bukan asumsi `us-east-1`.
+- **Region opt-in**. Beberapa region baru (Cape Town, Hong Kong, Jakarta) harus di-enable di Account Settings sebelum bisa dipakai. Default off untuk security.
+- **CloudFormation stack regional**. Stack di Jakarta tidak terlihat dari Singapore. Mau resource cross-region, butuh StackSets atau Terraform.
+- **VPC CIDR tidak overlap untuk peering**. Kalau berencana peering antar VPC (atau dengan on-prem), rencanakan CIDR dari awal. Migrasi VPC mahal.
+
+## Cross-provider
+
+| Provider | Konsep equivalent |
+|---|---|
+| Azure | Region + Availability Zone. Konsep mirip, beberapa region tidak punya AZ. Indonesia: Central Indonesia region (2024). |
+| GCP | Region + Zone. Tiap region punya 3+ zone. Indonesia: Jakarta (asia-southeast2). |
+| Oracle | Region + Availability Domain (AD). Beberapa region single-AD, beberapa multi-AD. Indonesia: belum ada per 2026. |
+
+## Pelajaran praktis
+
+- Default `ap-southeast-3` untuk app yang target user Indonesia.
+- Selalu pakai minimal 2 AZ untuk production workload. 3 AZ kalau bisa.
+- Cek service availability sebelum pilih region. Tool: [AWS Regional Services Lookup](https://aws.amazon.com/about-aws/global-infrastructure/regional-product-services/).
+- Jangan asumsi region kamu sama dengan default region di tutorial AWS. Banyak tutorial pakai `us-east-1`, kamu mungkin pakai `ap-southeast-3`.
+- Account ID dan resource ARN konsisten, region berbeda. Audit script harus iterate semua region kalau cari "semua resource".

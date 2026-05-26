@@ -1,4 +1,5 @@
 export default {
   index: 'Overview',
-  iam: 'IAM & Identity'
+  iam: 'IAM & Identity',
+  region: 'Region & AZ'
 }
