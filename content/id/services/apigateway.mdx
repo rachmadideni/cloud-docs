@@ -1,0 +1,148 @@
+# API Gateway
+
+**TL;DR**: Pintu HTTP/WebSocket di depan backend kamu. Routing, auth, rate limit, transform. Dua versi: REST API (v1) feature-lengkap tapi mahal, HTTP API (v2) lebih cepat dan murah. Pakai v2 kecuali butuh fitur spesifik v1.
+
+## Analogi
+
+Resepsionis kantor digital. Tamu (request) masuk, resepsionis cek apakah punya appointment (auth), tahu siapa orangnya (route), kirim ke department yang tepat (backend integration).
+
+## Kapan pakai
+
+- ✅ Endpoint HTTP di depan Lambda function.
+- ✅ Proxy ke layanan internal (EC2, ECS, Step Functions).
+- ✅ Public API dengan rate limiting per API key.
+- ✅ WebSocket server (chat, notification realtime).
+- ✅ Centralized JWT auth via authorizer (Cognito atau custom Lambda).
+- ✅ Request/response transform (XML to JSON, header rewrite).
+- ✅ Caching response untuk reduce backend load (REST API).
+
+## Kapan jangan
+
+- ❌ Webhook receiver yang butuh super-low latency. Pakai Function URL (Lambda direct).
+- ❌ Streaming response besar (server-sent events). Pakai ALB atau Function URL streaming.
+- ❌ TCP atau UDP traffic. Pakai NLB.
+- ❌ gRPC. Pakai NLB plus ALB belum support gRPC streaming penuh.
+
+## Dua versi: HTTP API vs REST API
+
+| Aspek | HTTP API (v2) | REST API (v1) |
+|---|---|---|
+| Latency | lebih rendah ~60% | tinggi |
+| Cost | $1.00 per 1M request | $3.50 per 1M |
+| Authorizer | JWT (Cognito, OIDC), Lambda | Cognito, Lambda, IAM |
+| Resource policy | tidak ada | ada |
+| Private endpoint (VPC) | tidak | ada |
+| Request validation | terbatas | full (model + validator) |
+| Caching | tidak ada | ada (mahal tapi) |
+| WebSocket | iya | tidak (WebSocket terpisah API type) |
+| Usage Plan + API Key | tidak | ada |
+| SDK generation | tidak | ada |
+
+**Aturan praktis**: pakai HTTP API. Pindah ke REST API kalau butuh API Key, private endpoint, atau request validation kompleks.
+
+## Pricing mental model
+
+| API type | Per 1M request |
+|---|---|
+| HTTP API | $1.00 |
+| REST API | $3.50 (paling murah) sampai $4.25 (top tier) |
+| WebSocket | $1.00 message + $0.25 connection-minute |
+
+Plus:
+- **Caching REST API**: $0.020/jam untuk 0.5 GB cache ($14/bulan), naik dengan size.
+- **Data transfer egress**: standard rate.
+- **CloudWatch Logs**: optional, untuk access log.
+
+Tagihan kaget:
+- **Caching cluster idle**: $14/bulan walau cache hit 0%.
+- **CloudWatch detailed metrics**: $0.30/metric/bulan, banyak metric kalau enable per-method.
+
+## Local emulator
+
+**Floci status**: ✅ full (REST + HTTP API v2 + WebSocket)
+
+```bash
+API_ID=$(awsl apigatewayv2 create-api --name demo \
+  --protocol-type HTTP \
+  --target arn:aws:lambda:us-east-1:000000000000:function:my-fn \
+  --query 'ApiId' --output text)
+
+# URL format Floci:
+echo "http://localhost:4566/restapis/$API_ID/local/_user_request_"
+```
+
+URL format `_user_request_` cuma di Floci. Di AWS asli: `https://xxxxx.execute-api.<region>.amazonaws.com`.
+
+## Hello-world
+
+HTTP API + Lambda paling cepat. One-liner via `--target`:
+
+```bash
+awsl apigatewayv2 create-api \
+  --name hello-api \
+  --protocol-type HTTP \
+  --target arn:aws:lambda:us-east-1:000000000000:function:hello
+```
+
+Ini auto-bikin: integration (AWS_PROXY) + default route + default stage. Single command langsung jalan.
+
+Untuk route granular:
+
+```bash
+# Bikin API kosong dulu
+API_ID=$(awsl apigatewayv2 create-api --name notes-api \
+  --protocol-type HTTP --query 'ApiId' --output text)
+
+# Integration ke Lambda
+INT_ID=$(awsl apigatewayv2 create-integration \
+  --api-id $API_ID \
+  --integration-type AWS_PROXY \
+  --integration-uri arn:aws:lambda:us-east-1:000000000000:function:notes \
+  --payload-format-version 2.0 \
+  --query 'IntegrationId' --output text)
+
+# Route per method
+awsl apigatewayv2 create-route --api-id $API_ID \
+  --route-key 'POST /notes' --target "integrations/$INT_ID"
+awsl apigatewayv2 create-route --api-id $API_ID \
+  --route-key 'GET /notes/{id}' --target "integrations/$INT_ID"
+```
+
+JWT Authorizer (untuk validate token Cognito):
+
+```bash
+awsl apigatewayv2 create-authorizer --api-id $API_ID \
+  --name cognito-jwt --authorizer-type JWT \
+  --identity-source '$request.header.Authorization' \
+  --jwt-configuration "Issuer=https://cognito-idp.us-east-1.amazonaws.com/POOL_ID,Audience=CLIENT_ID"
+```
+
+Attach authorizer ke route dengan `--authorization-type JWT --authorizer-id ...`.
+
+## Gotcha
+
+- **payload-format-version 2.0 vs 1.0**: event shape beda. HTTP API default 2.0 (lebih simpel), REST API 1.0. Code Lambda harus sesuai.
+- **CORS perlu set eksplisit**: cross-origin browser request kena CORS error tanpa config CORS di API Gateway. HTTP API support CORS native, REST API butuh integration response config.
+- **Timeout 30 detik max**: integration backend (Lambda atau HTTP endpoint) harus return dalam 30 detik. Long-running pattern: API return job ID, client polling status.
+- **Authorizer cache**: JWT/Lambda authorizer hasil di-cache per session/identitas. Token revoke tidak otomatis effect sampai cache expire (default 5 menit, configurable).
+- **Stage variable buat env handling**: dev/staging/prod pakai variable di URL. Hindari hardcode env di Lambda code.
+- **REST API gateway response default tidak include CORS header di error response**: 4xx/5xx dari Lambda tidak ada CORS header, browser kena CORS error untuk error response. Setup Gateway Response config.
+- **Throttling default per akun 10000 RPS regional**: bisa di-increase. Set throttle per stage atau per usage plan untuk protect downstream.
+- **HTTP API tidak punya request validation**: pakai schema validation di Lambda atau pakai REST API.
+- **Wildcard route `ANY /{proxy+}`**: catch-all yang forward semua ke Lambda. Lambda handle routing sendiri. Trade-off: kehilangan API Gateway-level rate limit per endpoint.
+- **API ID berubah saat delete-recreate**: jangan hardcode di client. Pakai custom domain.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | API Management | feature-lengkap, mahal |
+| GCP | API Gateway | basic |
+| GCP | Cloud Endpoints | OpenAPI-based |
+| Oracle | API Gateway | mirip AWS |
+| Self-hosted | Kong, Tyk, Krakend | open source alternative |
+
+## Belajar lebih lanjut
+
+- Pakai API Gateway di journey: [J2 REST API](/id/journeys/j2-rest-api), [J3 Auth](/id/journeys/j3-auth).
+- [AWS API Gateway docs](https://docs.aws.amazon.com/apigateway/).

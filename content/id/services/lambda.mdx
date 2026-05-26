@@ -1,0 +1,123 @@
+# Lambda
+
+**TL;DR**: Jalankan code tanpa manage server. Trigger via HTTP, event, atau schedule. Bayar per invocation plus duration. Auto-scale dari 0 ke ribuan paralel dalam detik.
+
+## Analogi
+
+Vending machine code. Kasih input, keluar output. Tidak ada mesin yang harus kamu hidupkan sebelumnya. Tidak dipakai = $0. Dipakai sejuta = bayar sejuta cup.
+
+## Kapan pakai
+
+- ✅ REST API endpoint dengan traffic variable atau rendah.
+- ✅ Event handler (S3 upload, DynamoDB stream, EventBridge).
+- ✅ Scheduled task (cron job) sekitar menit-an, bukan sub-detik.
+- ✅ Glue logic antar service AWS.
+- ✅ Image/file processing on-demand (thumbnail, OCR).
+- ✅ Webhook receiver dari third-party (Stripe, GitHub).
+- ✅ Build step di CI/CD pipeline.
+
+## Kapan jangan
+
+- ❌ Workload yang butuh persistent connection (WebSocket server, game server). Pakai ECS atau EC2.
+- ❌ Long-running job di atas 15 menit. Pakai Step Functions atau Fargate task.
+- ❌ Aplikasi yang butuh cold start ms-grade. Provisioned Concurrency bantu tapi mahal.
+- ❌ Workload constant tinggi 24/7 di scale besar. ECS/EKS lebih murah dengan reserved/savings plan.
+- ❌ Stateful workload (session in-memory). Lambda stateless, pakai DynamoDB/Redis untuk state.
+
+## Pricing mental model
+
+Dua dimensi:
+
+| Dimensi | Harga |
+|---|---|
+| Request | $0.20 per 1 juta invocation |
+| Duration | $0.0000166667 per GB-second |
+
+Memory range 128 MB sampai 10240 MB. Memory tinggi = CPU tinggi (proportional). Untuk workload CPU-bound, memory besar bisa lebih cepat sampai net lebih murah.
+
+Free tier permanen: 1 juta request + 400.000 GB-second per bulan.
+
+Yang sering bikin tagihan kaget:
+- **Function stuck di loop atau tunggu external API**: max 15 menit, billed full duration.
+- **Memory over-allocated**: 1 GB untuk function yang cuma butuh 256 MB = 4x bayar berlebihan.
+- **Frequent invocation dari S3 event di bucket besar**: ribuan file masuk = ribuan invocation tanpa batch.
+
+## Local emulator
+
+**Floci status**: ✅ full (Docker-native execution)
+
+Lambda di Floci spawn Docker container beneran. Code yang jalan di Floci 100% portable ke AWS asli (claim 1925/1925 SDK test pass).
+
+```bash
+awsl lambda create-function \
+  --function-name hello \
+  --runtime nodejs20.x \
+  --handler index.handler \
+  --role arn:aws:iam::000000000000:role/lambda-role \
+  --zip-file fileb://function.zip
+```
+
+Alternatif framework lokal:
+- **SAM CLI**: dari AWS, simulate Lambda + API Gateway lokal.
+- **serverless-offline**: plugin Serverless Framework.
+- **LocalStack Pro**: Lambda + lebih banyak service AWS.
+
+## Hello-world
+
+```js
+// index.js
+exports.handler = async (event) => {
+  console.log('Event:', JSON.stringify(event))
+  return {
+    statusCode: 200,
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ message: 'Hello from Lambda' })
+  }
+}
+```
+
+```bash
+zip function.zip index.js
+
+awsl lambda create-function \
+  --function-name hello \
+  --runtime nodejs20.x \
+  --handler index.handler \
+  --role arn:aws:iam::000000000000:role/lambda-role \
+  --zip-file fileb://function.zip
+
+awsl lambda invoke \
+  --function-name hello \
+  --payload '{"test":true}' \
+  --cli-binary-format raw-in-base64-out \
+  response.json && cat response.json
+```
+
+Untuk deploy serius pakai SAM, Serverless Framework, SST, atau CDK. Raw CLI cuma untuk paham mekanisme.
+
+## Gotcha
+
+- **Cold start**: invocation pertama setelah idle 5-15 menit kena penalty. Node ~100-500 ms, Python ~200 ms, Java/Spring Boot 1-3 detik, .NET ~1 detik. Mitigasi: Provisioned Concurrency, atau prefer Node/Python untuk latency-sensitive endpoint.
+- **15 menit max execution**: hard limit. Workload lebih lama pindah ke Step Functions, ECS, atau Batch.
+- **Zip package max 250 MB unzipped**: termasuk node_modules. Bundle tree-shaking penting. Untuk lebih besar, pakai container image (max 10 GB).
+- **Memory tidak bisa di-scale dinamis**: set saat create function. Untuk variable workload, sizing manual atau pakai Lambda Tuning Tools.
+- **Concurrent execution default limit 1000 per region**: traffic spike yang lewat limit kena throttle (HTTP 429). Bisa di-request increase.
+- **Function URL tidak punya custom auth**: kalau pakai Function URL (bukan API Gateway), authentication cuma IAM atau AWS_IAM. Untuk JWT atau custom, balik ke API Gateway.
+- **/tmp ephemeral 512 MB default**: bisa di-scale sampai 10 GB. Data hilang antar invocation.
+- **Environment variable bukan secret**: terlihat plain di console dan di SDK. Untuk secret pakai Secrets Manager atau Parameter Store SecureString.
+- **Cold start di VPC dulu lambat banget**: pre-2019 bisa 15 detik. Sekarang ~100 ms tapi tetap ada overhead. Kalau function tidak butuh VPC resource, jangan masukkan ke VPC.
+- **CloudWatch Logs cost**: function yang log verbose bisa $50/bulan untuk 5 GB log. Set retention 7-30 hari.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Functions | mirip, runtime support lebih banyak (PowerShell, C# script) |
+| GCP | Cloud Functions / Cloud Run | Cloud Run mirip Lambda + container-based, tanpa 15-min limit |
+| Oracle | Functions | based on Fn Project (open source) |
+
+## Belajar lebih lanjut
+
+- Pakai Lambda di journey: [J2 REST API](/id/journeys/j2-rest-api), [J4 File Upload](/id/journeys/j4-file-upload), [J5 Event-Driven](/id/journeys/j5-event-driven).
+- Observability: [J10](/id/journeys/j10-observability).
+- [AWS Lambda docs](https://docs.aws.amazon.com/lambda/).
