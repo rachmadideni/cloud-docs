@@ -9,5 +9,6 @@ export default {
   'j7-data-pipeline': 'J7 — Data Pipeline',
   'j8-container': 'J8 — Container Workload',
   'j9-kubernetes': 'J9 — Kubernetes',
-  'j10-observability': 'J10 — Observability'
+  'j10-observability': 'J10 — Observability',
+  'j11-security': 'J11 — Security Baseline'
 }
