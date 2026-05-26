@@ -10,5 +10,6 @@ export default {
   'j8-container': 'J8 — Container Workload',
   'j9-kubernetes': 'J9 — Kubernetes',
   'j10-observability': 'J10 — Observability',
-  'j11-security': 'J11 — Security Baseline'
+  'j11-security': 'J11 — Security Baseline',
+  'j12-ai-ml': 'J12 — AI/ML Inference'
 }
