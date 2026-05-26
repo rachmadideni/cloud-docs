@@ -6,5 +6,6 @@ export default {
   'j4-file-upload': 'J4 — File Upload Pipeline',
   'j5-event-driven': 'J5 — Event-Driven Backend',
   'j6-relational': 'J6 — Relational App',
-  'j7-data-pipeline': 'J7 — Data Pipeline'
+  'j7-data-pipeline': 'J7 — Data Pipeline',
+  'j8-container': 'J8 — Container Workload'
 }
