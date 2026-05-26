@@ -1,0 +1,23 @@
+{
+  "name": "cloud-docs",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "dev": "next dev",
+    "build": "next build",
+    "start": "next start",
+    "postinstall": "patch-package",
+    "postbuild": "pagefind --site out --output-path out/_pagefind"
+  },
+  "dependencies": {
+    "next": "^15.0.0",
+    "nextra": "^4.0.0",
+    "nextra-theme-docs": "^4.0.0",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "pagefind": "^1.1.1",
+    "patch-package": "^8.0.1"
+  }
+}

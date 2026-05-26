@@ -1,0 +1,110 @@
+### dev.http — test OpenAI-compatible API @ freemodel.dev
+### REST Client extension VSCode. Variable dari .env via {{$dotenv}}.
+### .env butuh: FREEMODEL_API_KEY=sk-xxx
+
+@baseUrl = https://api.freemodel.dev
+@apiKey = {{$dotenv FREEMODEL_API_KEY}}
+@model = gpt-5.5
+
+###
+### 1. List models
+GET {{baseUrl}}/v1/models
+Authorization: Bearer {{apiKey}}
+
+###
+### 2. Chat completion (non-stream)
+POST {{baseUrl}}/v1/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{
+  "model": "{{model}}",
+  "messages": [
+    { "role": "system", "content": "You are a concise assistant." },
+    { "role": "user", "content": "Sebutkan 3 layanan AWS untuk serverless." }
+  ],
+  "temperature": 0.7
+}
+
+###
+### 3. Chat completion (streaming SSE)
+POST {{baseUrl}}/v1/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+Accept: text/event-stream
+
+{
+  "model": "{{model}}",
+  "messages": [
+    { "role": "user", "content": "Tulis 5 baris haiku tentang cloud computing." }
+  ],
+  "stream": true
+}
+
+###
+### 4. Chat with tool calling
+POST {{baseUrl}}/v1/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{
+  "model": "{{model}}",
+  "messages": [
+    { "role": "user", "content": "Cuaca Jakarta hari ini?" }
+  ],
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "get_weather",
+        "description": "Get current weather for a city",
+        "parameters": {
+          "type": "object",
+          "properties": {
+            "city": { "type": "string" }
+          },
+          "required": ["city"]
+        }
+      }
+    }
+  ],
+  "tool_choice": "auto"
+}
+
+###
+### 5. JSON mode (structured output)
+POST {{baseUrl}}/v1/chat/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{
+  "model": "{{model}}",
+  "messages": [
+    { "role": "system", "content": "Respond in JSON only." },
+    { "role": "user", "content": "List top 3 AWS storage services with use case." }
+  ],
+  "response_format": { "type": "json_object" }
+}
+
+###
+### 6. Embeddings
+POST {{baseUrl}}/v1/embeddings
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{
+  "model": "text-embedding-3-small",
+  "input": "Cloud documentation for AWS, Azure, GCP."
+}
+
+###
+### 7. Legacy completions (kalau provider support)
+POST {{baseUrl}}/v1/completions
+Authorization: Bearer {{apiKey}}
+Content-Type: application/json
+
+{
+  "model": "{{model}}",
+  "prompt": "Cloud computing adalah",
+  "max_tokens": 64
+}

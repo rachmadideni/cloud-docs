@@ -1,0 +1,15 @@
+# Fallback Matrix
+
+Service AWS yang TIDAK di-cover floci → alternatif lokal:
+
+| Service | Fallback lokal |
+|---|---|
+| CloudFront | nginx reverse proxy + cache headers |
+| Rekognition | stub manual / skip |
+| X-Ray | Jaeger / OTel Collector |
+| GuardDuty / Inspector / Macie | conceptual doc, no emu |
+| Bedrock / SageMaker | Ollama (LLM lokal), training = doc only |
+| WAF, Shield | conceptual doc |
+| SES outbound delivery | Mailpit / MailHog |
+
+Catatan: untuk production-grade emulation gap di atas, opsi berbayar adalah LocalStack Pro.

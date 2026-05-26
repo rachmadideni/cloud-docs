@@ -1,0 +1,24 @@
+# Floci — AWS Emulator Lokal
+
+[floci.io](https://floci.io) = single-binary emulator AWS, 45 service, MIT, gratis total. Default tool untuk semua journey di docs ini.
+
+## Quick Start
+
+```yaml
+# docker-compose.yml
+services:
+  floci:
+    image: floci/floci:latest
+    ports: ['4566:4566']
+    volumes: ['/var/run/docker.sock:/var/run/docker.sock']
+```
+
+```bash
+docker compose up -d
+```
+
+Endpoint: `http://localhost:4566`. Compatible dengan AWS SDK manapun — set `endpoint` ke localhost.
+
+## Service Coverage
+
+Lihat [Fallback Matrix](/id/tools/fallback) untuk gap service.
