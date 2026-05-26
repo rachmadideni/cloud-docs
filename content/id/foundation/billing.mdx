@@ -1,0 +1,185 @@
+# Billing Model
+
+**TL;DR**: AWS charge per pemakaian, dengan metering granular per detik atau per request. Tagihan tinggi bukan karena harga unit mahal, tapi karena dimensi yang tidak terlihat: idle resource, data egress, NAT Gateway, cross-AZ transfer. Paham mental model billing sebelum deploy ke produksi.
+
+## Mental model
+
+AWS tidak menjual paket bulanan. Tidak ada "plan basic $10". Semua di-meter terus-menerus. Bayar persis apa yang dipakai.
+
+Konsekuensi:
+- Resource yang lupa di-shutdown tetap kena tagihan, walau tidak dipakai.
+- Free tier punya batas. Lewat batas, langsung billed di harga normal.
+- Tagihan akhir bulan adalah hasil ribuan transaksi kecil per service per region.
+
+Bagusnya: skala dari $0 (tidak pakai sama sekali) sampai jutaan dolar (Netflix, Airbnb). Tidak ada kontrak minimum untuk kebanyakan service.
+
+## Dimensi yang menentukan harga
+
+Setiap service punya kombinasi dimensi. Empat yang paling sering:
+
+| Dimensi | Satuan | Contoh |
+|---|---|---|
+| Compute | vCPU-hour, GB-second | EC2 t3.small $0.0224/jam, Lambda $0.0000166667 per GB-second |
+| Storage | GB-month | S3 Standard $0.023/GB/bulan, EBS gp3 $0.08/GB/bulan |
+| Request | per 1 juta | Lambda $0.20 per 1 juta, DynamoDB read $0.25 per 4 juta |
+| Transfer | GB | Egress ke internet $0.09/GB, cross-AZ $0.01/GB |
+
+Catatan: angka di atas snapshot, harga berubah. Jangan hardcode di calculator kamu. Selalu cek halaman pricing resmi sebelum estimate produksi.
+
+## Per service: pola tagihan
+
+### EC2
+
+Bayar per detik instance running (minimum 60 detik). Harga tergantung instance type, region, dan pricing model.
+
+| Model | Diskon | Komitmen |
+|---|---|---|
+| On-demand | 0% | tidak ada, bayar per detik |
+| Spot | 70-90% | bisa di-terminate sewaktu-waktu |
+| Reserved Instance | 30-70% | 1-3 tahun |
+| Savings Plans | 30-70% | 1-3 tahun, lebih fleksibel dari RI |
+
+Sticker shock: instance idle 24/7 yang lupa di-terminate. t3.small idle sebulan = sekitar $15. Web app development server yang lupa di-shutdown weekend = uang terbuang.
+
+### S3
+
+Tiga komponen utama:
+1. **Storage**: GB/bulan, tergantung storage class.
+2. **Request**: PUT/POST/DELETE lebih mahal dari GET. Per 1000 atau per 10000 request.
+3. **Transfer**: download dari S3 ke internet kena egress charge.
+
+Storage class:
+- Standard: $0.023/GB, untuk data sering diakses.
+- Infrequent Access: $0.0125/GB, plus retrieval fee.
+- Glacier Instant Retrieval: $0.004/GB, retrieval fee kecil.
+- Glacier Deep Archive: $0.00099/GB, retrieval butuh berjam-jam.
+
+Sticker shock: bucket dengan jutaan small file. Tiap file kena minimum storage per object. Plus request charges kalau di-list terus.
+
+### Lambda
+
+Dua dimensi:
+1. **Request**: $0.20 per 1 juta invocation.
+2. **Duration**: $0.0000166667 per GB-second. Memory yang dialokasi (128 MB sampai 10 GB) menentukan compute power dan harga per second.
+
+Free tier permanen: 1 juta request + 400.000 GB-second per bulan.
+
+Sticker shock: function yang stuck di loop atau tunggu external API selama 15 menit (max). Cost per execution melonjak. Set timeout pendek.
+
+### DynamoDB
+
+Dua mode:
+- **PAY_PER_REQUEST**: bayar per read/write unit. Cocok untuk traffic spiky atau tidak prediktabel.
+- **PROVISIONED**: alokasi RCU/WCU di muka. Lebih murah kalau traffic stabil dan terukur.
+
+Plus storage: $0.25/GB/bulan.
+
+Sticker shock: table dengan GSI banyak. Tiap GSI punya cost write sendiri (write ke base table dikenakan + write ke GSI dikenakan).
+
+### Data transfer (sering nomor 1 di bill)
+
+| Jenis transfer | Harga umum |
+|---|---|
+| Inbound ke AWS | gratis |
+| Egress ke internet | $0.09/GB (10 GB pertama gratis/bulan) |
+| Cross-region | $0.02/GB |
+| Cross-AZ (sama region) | $0.01/GB tiap arah |
+| Same AZ via private IP | gratis |
+| Same AZ via public IP | charged seperti cross-AZ |
+
+Sticker shock urutan parah:
+1. **NAT Gateway**: $0.045/jam ($32/bulan idle) plus $0.045/GB data processed. Aplikasi yang banyak akses internet via NAT bisa tagihan ribuan dolar.
+2. **CloudFront egress**: $0.085/GB pertama TB. Free tier 1 TB pertama 12 bulan.
+3. **Cross-AZ chatter**: microservice arsitektur dengan service di AZ berbeda kena dobel: response transfer kena, request kalau bukan minimal.
+
+## Free tier
+
+Dua jenis:
+
+### Free tier 12 bulan
+
+Berlaku untuk akun baru selama 12 bulan dari signup. Contoh: 750 jam EC2 t2.micro/bulan, 5 GB S3, 750 jam RDS db.t2.micro.
+
+Setelah 12 bulan, otomatis billed harga normal. Banyak orang kaget billed $500/bulan karena lupa free tier expire.
+
+### Always-free
+
+Selalu gratis, tanpa batas waktu. Contoh:
+- 1 juta Lambda request + 400k GB-second/bulan
+- 25 GB DynamoDB storage + 25 RCU/WCU
+- 5 GB CloudWatch logs/bulan
+- 100 GB CloudFront data transfer out/bulan (selalu gratis sejak 2021)
+
+Always-free yang sering bawa app side project tetap gratis: Lambda + DynamoDB + CloudFront. Bisa serve traffic puluhan ribu user tanpa bayar sepeser.
+
+## Sumber tagihan kaget (urut frekuensi)
+
+1. **Resource lupa di-terminate**. EC2, RDS, NAT Gateway, Load Balancer. Bikin habit: `aws ec2 describe-instances --query 'Reservations[*].Instances[?State.Name==\`running\`].[InstanceId,InstanceType,LaunchTime]'` sebelum tidur.
+2. **NAT Gateway**. Idle $32/bulan, plus per-GB processing. Untuk dev environment, pakai NAT Instance (EC2 kecil) atau VPC endpoint gratis untuk service AWS.
+3. **CloudWatch Logs retention infinite**. Default tidak ada expiry. Log Lambda yang verbose berbulan-bulan = storage gede. Set retention 7-30 hari.
+4. **Data egress dari S3 atau EC2 ke internet**. Audit traffic, pakai CloudFront sebagai cache untuk reduce origin egress.
+5. **Multi-AZ untuk dev/staging**. Bagus untuk produksi, mahal untuk dev. Single-AZ untuk non-prod.
+6. **Provisioned IOPS di EBS atau RDS**. Default `gp3` murah dan cukup untuk kebanyakan workload. `io2` cuma untuk database high-IOPS yang beneran butuh.
+7. **Region pricing mismatch**. Service yang sama bisa 2x lebih mahal di region tertentu. Cek pricing per region sebelum pilih.
+8. **AWS Backup yang aggressive**. Backup harian tanpa lifecycle = storage menumpuk. Set retention rule.
+
+## Tool cost management
+
+| Tool | Fungsi |
+|---|---|
+| **Cost Explorer** | breakdown cost per service/tag/region, trend 12 bulan |
+| **AWS Budgets** | alert kalau cost lewat threshold (mis. $50/bulan) |
+| **Cost Anomaly Detection** | ML deteksi spike tidak normal, alert otomatis |
+| **Trusted Advisor** | rekomendasi cost optimization (idle resource, RI savings) |
+| **Compute Optimizer** | rekomendasi rightsize EC2/Lambda berdasarkan utilization |
+
+**Action item hari pertama**: setup Budgets dengan threshold $5/bulan (untuk akun belajar) atau $50/bulan (untuk produksi kecil). Alert ke email saat 80% dan 100%.
+
+## Tagging untuk attribution cost
+
+Tag adalah label key-value yang nempel di resource. Contoh:
+
+```
+Environment=production
+Project=cloud-docs
+Owner=alice
+CostCenter=engineering
+```
+
+Activate cost allocation tag di Billing console. Setelah aktif, Cost Explorer bisa breakdown cost per tag. Bisa jawab pertanyaan: "berapa biaya project X bulan ini?".
+
+Setup tagging dari awal lebih mudah dari retrospektif. Resource tanpa tag jadi "untagged" bucket yang sulit di-attribute.
+
+## Floci coverage
+
+Floci tidak meng-emulate billing. Tidak ada Cost Explorer, tidak ada Budgets, tidak ada tagihan. Untuk belajar billing model, baca dokumen ini plus eksperimen langsung di akun AWS asli dengan free tier.
+
+Tip: bikin sub-akun (AWS Organizations) khusus untuk eksperimen, set budget $5. Kalau aksiden bikin RDS Multi-AZ yang $80/bulan, akun ini terisolasi dari produksi.
+
+## Gotcha
+
+- **Tagihan delay 24-48 jam**. Resource yang baru di-launch jam ini, baru muncul di Cost Explorer besok atau lusa. Real-time monitoring perlu CloudWatch Metrics, bukan Cost Explorer.
+- **Free tier per akun, bukan per user IAM**. Akun dengan 10 user IAM share free tier yang sama, bukan 10x.
+- **Pricing exclude tax**. Harga di pricing page belum termasuk VAT/GST. Indonesia kena PPN 11% di atas harga.
+- **Pricing exclude support plan**. Basic support gratis, Developer $29/bulan, Business $100 atau 10% dari bill (yang lebih besar). Production akun biasanya butuh minimal Developer.
+- **Account-level service limits punya cost implication**. EBS volume default limit 50 TB/region. Naikkan limit hanya kalau butuh, tidak gratis kalau lupa lagi pakai.
+- **Reserved Instance tidak refundable**. Beli RI 3 tahun, app pindah platform tahun ke-1, RI hangus. Pakai Savings Plans yang lebih fleksibel kecuali traffic super-prediktabel.
+- **Cross-account transfer di Organizations**. Cost antar-akun tidak otomatis di-charge ke payer account. Setup consolidated billing dulu.
+
+## Cross-provider
+
+| Provider | Konsep beda |
+|---|---|
+| Azure | Pay-as-you-go default sama. Punya Azure Reserved Instances dan Spot. Beda: Azure punya "Cost Management + Billing" lebih terpadu di portal. |
+| GCP | Sustained Use Discount otomatis (semakin lama pakai, makin murah, tanpa komitmen). Plus Committed Use Discount untuk komitmen. |
+| Oracle | Pay-as-you-go. Free tier "Always Free" lebih generous (2 VM ARM, 200 GB block storage, dll). Cocok untuk eksperimen long-term gratis. |
+
+## Pelajaran praktis
+
+- Setup AWS Budgets di hari pertama. Tanpa budget alert, kamu blind.
+- Untuk side project: stack always-free (Lambda + DynamoDB + CloudFront + S3) bisa serve ribuan user gratis.
+- Untuk produksi: hitung cost per request dari awal, sebelum traffic naik. Kalau cost/request makin naik di traffic tinggi, arsitektur salah.
+- NAT Gateway adalah enemy nomor satu. Untuk VPC dev, pakai public subnet plus security group ketat sebagai gantinya.
+- Audit `aws ec2 describe-volumes` cari EBS volume status `available` (unattached). Bayar walau tidak dipakai. Hapus atau snapshot lalu hapus.
+- Log retention default infinite untuk CloudWatch. Set ke 7-30 hari kecuali ada regulatory requirement.
+- Audit tagging tiap bulan. Resource tanpa tag = cost yang tidak bisa di-attribute = pembersihan susah nanti.

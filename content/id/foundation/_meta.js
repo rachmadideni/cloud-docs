@@ -1,5 +1,6 @@
 export default {
   index: 'Overview',
   iam: 'IAM & Identity',
-  region: 'Region & AZ'
+  region: 'Region & AZ',
+  billing: 'Billing Model'
 }
