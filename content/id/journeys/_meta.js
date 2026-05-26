@@ -8,5 +8,6 @@ export default {
   'j6-relational': 'J6 — Relational App',
   'j7-data-pipeline': 'J7 — Data Pipeline',
   'j8-container': 'J8 — Container Workload',
-  'j9-kubernetes': 'J9 — Kubernetes'
+  'j9-kubernetes': 'J9 — Kubernetes',
+  'j10-observability': 'J10 — Observability'
 }
