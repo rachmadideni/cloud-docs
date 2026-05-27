@@ -10,5 +10,13 @@ export default {
   acm: 'ACM',
   cognito: 'Cognito',
   ecs: 'ECS',
-  ecr: 'ECR'
+  ecr: 'ECR',
+  sqs: 'SQS',
+  sns: 'SNS',
+  eventbridge: 'EventBridge',
+  stepfunctions: 'Step Functions',
+  kinesis: 'Kinesis',
+  firehose: 'Data Firehose',
+  glue: 'Glue',
+  athena: 'Athena'
 }

@@ -1,0 +1,111 @@
+# SNS (Simple Notification Service)
+
+**TL;DR**: Pub/sub messaging. Producer publish ke topic, semua subscriber terima copy. Fanout ke SQS, Lambda, HTTP webhook, email, SMS. Pesan tidak persist (kalau no subscriber, hilang).
+
+## Analogi
+
+Mailing list company. Sender email sekali ke `all@`, semua di list terima copy. Yang resign tidak terima lagi setelah unsubscribe.
+
+## Kapan pakai
+
+- ✅ Fanout event ke banyak service (mis. `order.created` → email + analytics + inventory).
+- ✅ Push notification mobile (FCM, APNs via SNS Mobile Push).
+- ✅ SMS notification (OTP, alert).
+- ✅ Email notification simpel (alert ops ke ops@team.com).
+- ✅ Webhook dispatch ke endpoint HTTP external.
+- ✅ Cross-region atau cross-account fanout.
+
+## Kapan jangan
+
+- ❌ Need pesan persist sampai consumer ready. Pakai SQS.
+- ❌ Need filter/routing kompleks dengan pattern matching. Pakai EventBridge.
+- ❌ Streaming dengan rewind / replay. Pakai Kinesis.
+- ❌ Email marketing dengan tracking detail. Pakai SES atau third-party (Mailchimp).
+- ❌ SMS bulk marketing. SNS untuk transactional, not marketing.
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| Publish | $0.50 per 1 juta pesan |
+| Delivery ke SQS | $0.50 per 1 juta |
+| Delivery ke Lambda | $0.60 per 1 juta |
+| Delivery ke HTTP/HTTPS | $0.60 per 1 juta |
+| SMS Indonesia | sekitar $0.04 per SMS (mahal) |
+| Email | $2.00 per 100k |
+| Mobile push | $0.50 per 1 juta |
+
+Free tier: 1 juta publish + 1 juta delivery/bulan permanen.
+
+Tagihan kaget: SMS volume tinggi. Untuk OTP/notification ke ribuan user, biaya berlipat. Cek dulu strategi (push notification gratis, SMS premium).
+
+## Local emulator
+
+**Floci status**: ✅ full
+
+```bash
+TOPIC_ARN=$(awsl sns create-topic --name events \
+  --query 'TopicArn' --output text)
+
+# Subscribe SQS
+awsl sns subscribe --topic-arn $TOPIC_ARN \
+  --protocol sqs --notification-endpoint $QUEUE_ARN
+```
+
+## Hello-world
+
+Fanout sederhana: 1 publish, 2 subscriber (SQS + Lambda).
+
+```bash
+# Topic
+TOPIC_ARN=$(awsl sns create-topic --name order-events \
+  --query 'TopicArn' --output text)
+
+# Subscribe SQS
+QUEUE_ARN=arn:aws:sqs:us-east-1:000000000000:order-queue
+awsl sns subscribe --topic-arn $TOPIC_ARN \
+  --protocol sqs --notification-endpoint $QUEUE_ARN
+
+# Subscribe Lambda
+awsl sns subscribe --topic-arn $TOPIC_ARN \
+  --protocol lambda \
+  --notification-endpoint arn:aws:lambda:us-east-1:000000000000:function:notify
+
+awsl lambda add-permission --function-name notify \
+  --statement-id sns --action lambda:InvokeFunction \
+  --principal sns.amazonaws.com --source-arn $TOPIC_ARN
+
+# Publish
+awsl sns publish --topic-arn $TOPIC_ARN \
+  --message '{"orderId":"123","amount":250000}' \
+  --message-attributes 'event_type={DataType=String,StringValue=order.created}'
+```
+
+Subscriber SQS terima pesan di queue. Lambda invoke dengan event berisi SNS message.
+
+## Gotcha
+
+- **No persistence**: pesan publish saat tidak ada subscriber = hilang. Untuk persist, subscribe SQS yang akan tahan pesan sampai consumer ready.
+- **Lambda subscribe = async invocation**: SNS tidak peduli Lambda success atau fail. Lambda harus handle retry sendiri atau pakai DLQ.
+- **HTTP/HTTPS subscriber confirm wajib**: setelah subscribe, SNS kirim confirmation request ke endpoint. Endpoint harus auto-confirm via header `x-amz-sns-message-type: SubscriptionConfirmation`.
+- **Message filtering by attribute**: subscriber bisa set filter `{"event_type": ["order.created"]}` untuk cuma terima pesan tertentu. Hemat invocation tidak relevan.
+- **Message size max 256 KB**: sama SQS. Untuk besar, pakai S3 pointer.
+- **SMS opt-out sticky**: user yang reply STOP masuk opt-out list. Tidak bisa di-resubscribe via API. Hati-hati transactional SMS yang user dianggap spam.
+- **SNS FIFO**: ada sejak 2020, ordered delivery + dedup. Pakai kalau butuh ordered fanout.
+- **Cross-region fanout**: publisher di us-east-1, subscriber di ap-southeast-3. Bisa, tapi pakai cross-region replication overhead.
+- **Lambda destinations alternative**: untuk simple fanout dari Lambda async invocation, pakai Lambda Destination (success/failure target). Lebih simpel dari SNS untuk 1-2 target.
+- **Subscription confirmation di console manual**: HTTP subscriber yang tidak auto-confirm butuh klik link di payload. Mudah lupa.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Service Bus Topic | mirip, lebih feature-rich |
+| GCP | Pub/Sub | hybrid queue + topic |
+| Oracle | Notifications | basic |
+| Self-hosted | Kafka | streaming + pub/sub combo |
+
+## Belajar lebih lanjut
+
+- Pakai SNS di journey: [J5 Event-Driven](/id/journeys/j5-event-driven).
+- [AWS SNS docs](https://docs.aws.amazon.com/sns/).
