@@ -3,6 +3,12 @@ export default {
   s3: 'S3',
   lambda: 'Lambda',
   dynamodb: 'DynamoDB',
+  rds: 'RDS',
   apigateway: 'API Gateway',
-  cognito: 'Cognito'
+  cloudfront: 'CloudFront',
+  route53: 'Route53',
+  acm: 'ACM',
+  cognito: 'Cognito',
+  ecs: 'ECS',
+  ecr: 'ECR'
 }
