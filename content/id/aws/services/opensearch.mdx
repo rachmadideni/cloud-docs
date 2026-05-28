@@ -1,0 +1,172 @@
+# OpenSearch
+
+**TL;DR**: Managed Elasticsearch fork. Search engine + analytics + dashboard (OpenSearch Dashboards = fork Kibana). Pakai untuk full-text search, log analytics, real-time dashboard, vector search (k-NN plugin).
+
+## Analogi
+
+Database khusus untuk teks dan analytic agregat. Bukan tempat simpan source-of-truth (pakai RDS/DynamoDB), tapi index yang sync dari source untuk query cepat.
+
+## Kapan pakai
+
+- ✅ Full-text search di produk, dokumen, artikel.
+- ✅ Log analytics centralized (alternative CloudWatch Logs Insights).
+- ✅ Real-time dashboard dengan refresh detik-an.
+- ✅ Vector search via k-NN plugin (untuk RAG, semantic search).
+- ✅ Geo search (filter by location).
+- ✅ Aggregation kompleks (faceted search, drill-down).
+
+## Kapan jangan
+
+- ❌ Source-of-truth database. OpenSearch eventually consistent, tidak ACID.
+- ❌ Workload kecil. Cluster minimum ~$25/bulan, tidak worth untuk data sedikit.
+- ❌ Simple search di RDS (LIKE query cukup). Tidak perlu OpenSearch.
+- ❌ Document database dengan transaction. Pakai DocumentDB atau MongoDB.
+
+## OpenSearch Service vs Serverless
+
+| Aspek | OpenSearch Service | OpenSearch Serverless |
+|---|---|---|
+| Pricing | per-node hour | per OCU (Compute Unit) |
+| Minimum | 1 node ~$25/bulan | 4 OCU minimum ~$700/bulan |
+| Scale | manual atau ML-based | auto |
+| Vector engine | iya | iya |
+| Use case | predictable traffic | bursty, agentic AI |
+
+Service lebih murah untuk small-medium workload. Serverless mahal di low-volume, lebih simpel di scale unpredictable.
+
+## Pricing mental model
+
+### OpenSearch Service
+
+| Instance type | Harga (us-east-1) |
+|---|---|
+| t3.small.search | ~$24/bulan |
+| t3.medium.search | ~$48/bulan |
+| m6g.large.search | ~$95/bulan |
+| Storage EBS | ~$0.12/GB/bulan |
+| Data transfer cross-AZ | $0.01/GB |
+
+Minimum production: 3-node dengan dedicated master = ~$100-300/bulan.
+
+### Serverless
+
+| Komponen | Harga |
+|---|---|
+| OCU-hour (search) | $0.24 |
+| OCU-hour (indexing) | $0.24 |
+| Storage | $0.024/GB/bulan |
+| Minimum collection | 4 OCU = ~$700/bulan |
+
+## Local emulator
+
+**Floci status**: ✅ full (REST JSON)
+
+```bash
+awsl opensearch create-domain \
+  --domain-name app-logs \
+  --engine-version "OpenSearch_2.11" \
+  --cluster-config InstanceType=t3.small.search,InstanceCount=1
+
+# Tunggu domain ready (lama di AWS asli, di Floci cepat)
+awsl opensearch wait domain-available --domain-name app-logs
+```
+
+Akses Dashboard: `http://<endpoint>/_dashboards`.
+
+## Hello-world
+
+### Index dokumen
+
+```bash
+ENDPOINT="http://localhost:4566/2021-01-01/opensearch/domain/app-logs"
+
+# Bikin index dengan mapping
+curl -X PUT "$ENDPOINT/products" -H 'Content-Type: application/json' -d '{
+  "mappings": {
+    "properties": {
+      "name": { "type": "text" },
+      "price": { "type": "double" },
+      "tags": { "type": "keyword" }
+    }
+  }
+}'
+
+# Index dokumen
+curl -X POST "$ENDPOINT/products/_doc" -H 'Content-Type: application/json' -d '{
+  "name": "Atomic Habits",
+  "price": 89000,
+  "tags": ["self-help", "non-fiction"]
+}'
+```
+
+### Search
+
+```bash
+curl -X GET "$ENDPOINT/products/_search" -H 'Content-Type: application/json' -d '{
+  "query": {
+    "multi_match": {
+      "query": "habits",
+      "fields": ["name", "tags"]
+    }
+  },
+  "aggs": {
+    "by_tag": { "terms": { "field": "tags" } }
+  }
+}'
+```
+
+### Vector search (k-NN)
+
+```bash
+# Index dengan field vector
+curl -X PUT "$ENDPOINT/docs" -d '{
+  "settings": { "index.knn": true },
+  "mappings": {
+    "properties": {
+      "embedding": {
+        "type": "knn_vector",
+        "dimension": 768,
+        "method": { "name": "hnsw", "space_type": "cosinesimil" }
+      },
+      "text": { "type": "text" }
+    }
+  }
+}'
+
+# Query nearest neighbor
+curl -X POST "$ENDPOINT/docs/_search" -d '{
+  "size": 5,
+  "query": {
+    "knn": {
+      "embedding": { "vector": [0.1, 0.2, ...], "k": 5 }
+    }
+  }
+}'
+```
+
+## Gotcha
+
+- **OpenSearch vs Elasticsearch**: fork sejak 2021 dispute lisensi. API mostly compatible, SDK terpisah. Pilih sesuai ekosistem yang lebih kuat.
+- **Cluster sizing tricky**: salah pilih instance type = re-deploy atau migrate. Pakai shard sizing calculator (rule of thumb: shard 10-50 GB, max 1000 shard per node).
+- **No transaction**: index update eventually consistent. Tidak cocok source-of-truth.
+- **Reindex untuk schema change**: ubah mapping field existing = bikin index baru, copy data, alias swap. Plan dari awal.
+- **Snapshot ke S3**: backup native via snapshot. Schedule daily untuk produksi.
+- **VPC vs public domain**: VPC lebih aman, butuh setup endpoint. Public domain bisa diakses dari mana saja (lindungi dengan IAM atau IP).
+- **Master node untuk produksi**: cluster tanpa dedicated master rentan split-brain di traffic tinggi. Dedicated master 3 node minimum.
+- **Hot/warm/cold storage**: data tua pindah ke node murah (warm) atau snapshot S3 (cold). Hemat cost storage tinggi.
+- **OpenSearch Dashboards default tanpa auth**: setup Cognito atau fine-grained access control sebelum expose.
+- **Ingestion pipeline lambat**: kalau Lambda subscribe CloudWatch Logs → write ke OpenSearch, throughput limited. Pakai Firehose ke OpenSearch destination untuk batch.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Cognitive Search | proprietary, broader feature |
+| GCP | Vertex AI Search | AI-first |
+| Self-hosted | Elasticsearch / OpenSearch | open source, full ops |
+| Modern alt | Meilisearch, Typesense | ringan, search-focused |
+
+## Belajar lebih lanjut
+
+- Pakai OpenSearch di journey: [J10 Observability](/id/aws/journeys/j10-observability), [J12 AI/ML](/id/aws/journeys/j12-ai-ml).
+- [OpenSearch docs](https://opensearch.org/docs/).

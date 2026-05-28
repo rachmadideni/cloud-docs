@@ -1,0 +1,65 @@
+# Service Reference
+
+Halaman deep-dive per AWS service. Setiap halaman pakai template sama: TL;DR, kapan pakai, kapan jangan, pricing model, local emulator, hello-world, gotcha, cross-provider.
+
+Service di-link dari [Use-Case Journey](/id/aws/journeys) yang relevan. Mulai dari journey kalau kamu baru, atau langsung ke service kalau cari detail spesifik.
+
+## Compute
+
+- [Lambda](/id/aws/services/lambda), serverless function
+- [ECS](/id/aws/services/ecs), container orchestrator (Fargate atau EC2 launch)
+- [EKS](/id/aws/services/eks), managed Kubernetes
+- [ECR](/id/aws/services/ecr), Docker registry private
+
+## Storage
+
+- [S3](/id/aws/services/s3), object storage
+
+## Database
+
+- [DynamoDB](/id/aws/services/dynamodb), NoSQL key-value managed
+- [RDS](/id/aws/services/rds), managed Postgres / MySQL / MariaDB / Oracle / SQL Server
+
+## API & networking
+
+- [API Gateway](/id/aws/services/apigateway), managed HTTP/REST API + WebSocket
+- [ALB](/id/aws/services/alb), Application Load Balancer (layer 7)
+- [CloudFront](/id/aws/services/cloudfront), CDN global
+- [Route53](/id/aws/services/route53), managed DNS
+
+## Identity & certificate
+
+- [Cognito](/id/aws/services/cognito), user authentication
+- [ACM](/id/aws/services/acm), SSL/TLS certificate gratis
+
+## Messaging & orchestration
+
+- [SQS](/id/aws/services/sqs), managed queue
+- [SNS](/id/aws/services/sns), pub/sub fanout
+- [EventBridge](/id/aws/services/eventbridge), event bus dengan routing rule
+- [Step Functions](/id/aws/services/stepfunctions), state machine workflow
+
+## Streaming & analytics
+
+- [Kinesis](/id/aws/services/kinesis), real-time data streaming
+- [Data Firehose](/id/aws/services/firehose), batched delivery ke S3 / OpenSearch / Redshift
+- [Glue](/id/aws/services/glue), ETL + Data Catalog
+- [Athena](/id/aws/services/athena), serverless SQL query untuk data S3
+
+## Observability
+
+- [CloudWatch](/id/aws/services/cloudwatch), metrics + logs + alarm + dashboard
+- [X-Ray](/id/aws/services/xray), distributed tracing
+- [OpenSearch](/id/aws/services/opensearch), search + log analytics + vector search
+
+## Security
+
+- [KMS](/id/aws/services/kms), encryption key managed
+- [Secrets Manager](/id/aws/services/secretsmanager), secret storage dengan rotation
+- [CloudTrail](/id/aws/services/cloudtrail), audit log API call
+- [GuardDuty](/id/aws/services/guardduty), threat detection
+
+## AI/ML
+
+- [Bedrock](/id/aws/services/bedrock), foundation model API (Claude, Llama, Titan, Stable Diffusion)
+- [SageMaker](/id/aws/services/sagemaker), ML platform end-to-end

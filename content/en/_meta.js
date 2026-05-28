@@ -1,3 +1,5 @@
 export default {
-  index: 'Home'
+  index: 'Home',
+  aws: 'AWS',
+  supabase: 'Supabase'
 }

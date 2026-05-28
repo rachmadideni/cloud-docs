@@ -1,0 +1,311 @@
+# Dev Workflow
+
+Pattern harian developer cloud: start lokal, code, test, switch ke AWS asli, debug, cleanup. Plus tool tambahan untuk hidup lebih enak.
+
+## Daily routine
+
+### Pagi: start lokal
+
+```bash
+cd ~/projects/my-app
+docker compose up -d
+# Tunggu Floci ready
+curl http://localhost:4566/_localstack/health
+```
+
+### Code dengan hot reload
+
+Untuk Lambda local invocation:
+
+```bash
+# SAM CLI lokal
+sam local start-api --port 3000
+# Edit handler.js, request ke localhost:3000 langsung pakai code baru
+```
+
+Untuk app non-Lambda (express, fastify):
+
+```bash
+npm run dev   # nodemon atau tsx watch
+```
+
+### Test integration
+
+```bash
+npm test
+# Test pakai env AWS_ENDPOINT_URL=http://localhost:4566
+```
+
+### Sore: stop
+
+```bash
+docker compose down       # stop, simpan volume
+# atau
+docker compose down -v    # stop + hapus volume (wipe data)
+```
+
+## Migration: AWS asli ke lokal
+
+Skenario: kamu mau debug bug yang muncul di staging. Replicate setup ke lokal.
+
+1. **Export resource definition** via AWS CLI:
+
+```bash
+# DynamoDB table
+aws dynamodb describe-table --table-name Users --profile staging > table.json
+
+# Lambda function
+aws lambda get-function --function-name notes-api --profile staging > fn.json
+
+# Cognito User Pool
+aws cognito-idp describe-user-pool --user-pool-id us-east-1_xxxxx --profile staging > pool.json
+```
+
+2. **Recreate di Floci** dengan modifikasi minor (account ID, ARN, dll):
+
+```bash
+awsl dynamodb create-table --cli-input-json file://table.json
+```
+
+3. **Seed sample data**. Kalau bisa ekspor partial data via `aws dynamodb scan` (hati-hati kalau berisi PII):
+
+```bash
+aws dynamodb scan --table-name Users --profile staging --max-items 10 > sample.json
+awsl dynamodb batch-write-item --request-items file://import.json
+```
+
+4. **Run app dengan endpoint Floci**, reproduce bug.
+
+## Migration: lokal ke AWS asli
+
+Skenario: code stable di Floci, deploy ke staging atau prod.
+
+3 perubahan dari pola lokal:
+
+1. **Hapus endpoint override**: SDK auto-resolve ke AWS asli kalau `AWS_ENDPOINT_URL` tidak set.
+
+```js
+const client = new DynamoDBClient({
+  endpoint: process.env.AWS_ENDPOINT_URL,   // undefined di prod = pakai AWS
+  region: 'ap-southeast-3'
+})
+```
+
+2. **Account ID di ARN**: ganti `000000000000` (Floci default) dengan real account ID.
+
+```bash
+ACCOUNT_ID=$(aws sts get-caller-identity --query Account --output text)
+# Pakai di Terraform variable atau env var deploy
+```
+
+3. **VPC + Security Group**: lokal skip, prod wajib. Setup IaC dari awal.
+
+Plus opsi:
+
+4. **Secret management**: env var lokal pindah ke Secrets Manager / Parameter Store.
+
+5. **IAM role scope**: lokal pakai admin policy untuk simplicity. Prod harus least-privilege per service.
+
+## Profile switching
+
+Multiple AWS account (dev, staging, prod) plus personal. Tool yang bantu:
+
+### aws-vault (secure credential storage)
+
+Simpan credential di OS keychain (Keychain Mac, Credential Manager Windows, libsecret Linux). Bukan plain text di `~/.aws/credentials`.
+
+```bash
+# Install
+brew install --cask aws-vault   # Mac
+# Windows: download dari github releases
+
+# Add profile
+aws-vault add dev
+# masukkan key + secret, simpan di keychain
+
+# Exec command pakai profile
+aws-vault exec dev -- aws s3 ls
+aws-vault exec prod --duration=1h -- aws s3 ls   # custom duration
+```
+
+Pro: tidak ada plain credential di disk. Cons: extra step `aws-vault exec`.
+
+### granted (profile switcher cantik)
+
+```bash
+brew install granted
+
+# Switch profile interactive
+assume dev
+# Sekarang shell pakai profile dev
+```
+
+Cocok kalau switch profile sering. Browser plugin Granted juga bantu buka AWS console di profile yang tepat.
+
+### Built-in: env var
+
+Simpel tanpa tool tambahan:
+
+```bash
+export AWS_PROFILE=dev
+aws s3 ls   # pakai dev
+
+export AWS_PROFILE=prod
+aws s3 ls   # pakai prod
+```
+
+## Debug pattern
+
+### Lambda yang gagal di prod
+
+```bash
+# Log Lambda terakhir
+aws logs tail /aws/lambda/notes-api --follow --since 10m --profile prod
+
+# Filter cuma error
+aws logs filter-log-events \
+  --log-group-name /aws/lambda/notes-api \
+  --filter-pattern 'ERROR' \
+  --start-time $(date -d '1 hour ago' +%s)000 \
+  --profile prod
+```
+
+### Akses RDS di private subnet
+
+Bastion EC2:
+
+```bash
+# Setup tunnel SSH
+ssh -i my-key.pem -L 5432:rds-endpoint:5432 ec2-user@bastion-ip
+
+# Sekarang psql localhost:5432 jalan via bastion
+psql -h localhost -U postgres
+```
+
+SSM Session Manager (lebih aman, no SSH key):
+
+```bash
+# Install plugin sekali
+brew install --cask session-manager-plugin
+
+# Connect ke instance tanpa SSH
+aws ssm start-session --target i-0123456789
+
+# Port forward ke RDS
+aws ssm start-session \
+  --target i-bastion \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["rds-endpoint"],"portNumber":["5432"],"localPortNumber":["5432"]}'
+```
+
+### IAM permission denied debug
+
+```bash
+# Pakai Policy Simulator (gratis)
+aws iam simulate-principal-policy \
+  --policy-source-arn arn:aws:iam::xxx:user/alice \
+  --action-names s3:GetObject \
+  --resource-arns arn:aws:s3:::my-bucket/file.txt
+```
+
+Output: allowed atau denied plus penjelasan policy mana yang block.
+
+### Trace request lewat banyak service
+
+Pakai X-Ray (AWS asli) atau Jaeger (lokal). Setup OpenTelemetry SDK di Lambda untuk emit segment.
+
+Lihat [J10 Observability](/id/aws/journeys/j10-observability).
+
+## Useful CLI tools
+
+### awscli-local (alias resmi LocalStack-compatible)
+
+```bash
+pip install awscli-local
+# Sekarang: awslocal s3 ls (auto-endpoint Floci/LocalStack)
+```
+
+Works dengan Floci. Setting endpoint env var: `LOCALSTACK_HOSTNAME=localhost`.
+
+### steampipe (query AWS via SQL)
+
+```bash
+brew install turbot/tap/steampipe
+steampipe plugin install aws
+
+steampipe query "select instance_id, instance_type from aws_ec2_instance"
+```
+
+Audit dengan SQL syntax, tidak perlu hapal CLI flag.
+
+### saw (better CloudWatch Logs CLI)
+
+```bash
+brew install TylerBrock/saw/saw
+saw watch /aws/lambda/notes-api --filter ERROR
+```
+
+Lebih ergonomic dari `aws logs tail` untuk multi-stream tailing.
+
+### terraform-docs (auto-generate doc dari Terraform)
+
+```bash
+brew install terraform-docs
+terraform-docs markdown table modules/lambda-api/ > modules/lambda-api/README.md
+```
+
+CI step: validate doc tetap sync dengan kode.
+
+### aws-nuke (cleanup semua resource di akun)
+
+⚠️ destructive. Untuk dev/sandbox account, bukan prod.
+
+```bash
+brew install aws-nuke
+aws-nuke -c config.yml --no-dry-run
+```
+
+Hapus SEMUA resource di akun. Berguna kalau sandbox akun jadi messy.
+
+### IAM Access Analyzer (built-in AWS)
+
+Analyze policy yang terlalu permisif:
+
+```bash
+aws accessanalyzer create-analyzer --analyzer-name org-analyzer --type ACCOUNT
+aws accessanalyzer list-findings --analyzer-arn arn:...
+```
+
+## Kebiasaan baik (yang sering dilupakan)
+
+- **Setup Budget alert hari pertama**: $5 untuk akun belajar, $50-100 untuk produksi. Tanpa alert, kamu blind.
+- **Tagging dari awal**: `Environment`, `Project`, `Owner`, `CostCenter`. Resource tanpa tag = cost yang tidak bisa di-attribute.
+- **Log retention**: set 7-30 hari. Default infinite = mahal jangka panjang.
+- **MFA root hari pertama**: hardware key kalau bisa. Tanpa MFA, root = single point of catastrophe.
+- **Lifecycle policy S3 + ECR**: hindari storage menumpuk diam-diam.
+- **Stop dev instance weekend**: pakai EventBridge Scheduler atau Instance Scheduler solution.
+- **Audit akun bulanan**: `aws iam credential-report`, cari user dengan key lebih dari 90 hari.
+- **Backup test restore**: jangan tunggu disaster baru tahu backup tidak working.
+- **IaC untuk semua resource produksi**: console click = drift, susah audit.
+- **Doc dengan README per repo**: minimal "cara setup, cara run test, cara deploy".
+
+## Anti-pattern (yang sering dilakukan, sebaiknya hindari)
+
+- **Long-term access key di disk** untuk service-to-service auth. Pakai role + AssumeRole.
+- **AdministratorAccess policy** untuk semua user. Scope per role.
+- **Public S3 bucket tanpa intent**. Default private, opt-in public eksplisit.
+- **NAT Gateway di dev environment**. $32/bulan idle. Pakai VPC endpoint atau public subnet kalau dev.
+- **Multi-AZ RDS untuk dev**. 2x cost untuk benefit yang tidak relevan di dev.
+- **Hardcoded ARN/account ID di code**. Pakai env var atau IAM context.
+- **Skipping plan / dry-run**. `terraform plan` sebelum apply, `--dry-run` di destructive op.
+- **No alarm di production**. Diam-diam down sampai user complain.
+- **`docker run --privileged`** untuk workaround. Cari root cause permission.
+- **Hardcoded region**. Pakai env var atau profile default.
+
+## Belajar lebih lanjut
+
+- [Floci setup](/id/aws/tools/floci).
+- [AWS CLI detail](/id/aws/tools/aws-cli).
+- [IaC tools](/id/aws/tools/iac-tools).
+- [CI/CD setup](/id/aws/tools/cicd).
+- [Foundation: IAM](/id/aws/foundation/iam), [Region](/id/aws/foundation/region), [Billing](/id/aws/foundation/billing).

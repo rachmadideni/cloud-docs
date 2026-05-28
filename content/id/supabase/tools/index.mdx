@@ -1,0 +1,33 @@
+# Tools & Local Dev — Supabase
+
+> **Skeleton.** Halaman ini akan diisi setup local dev, CLI workflow, migration, branching, dan tooling pendamping.
+
+## Outline target
+
+### Supabase CLI
+
+- Install per OS (Windows / Mac / Linux)
+- `supabase init` — bootstrap project
+- `supabase start` — jalankan full stack lokal (Postgres + GoTrue + Storage + Realtime + Edge Runtime + Studio)
+- `supabase status` — endpoint dan kredensial lokal
+- `supabase db reset` — apply ulang migrasi dari awal
+
+### Migration workflow
+
+- `supabase migration new <name>` — bikin file migrasi SQL
+- `supabase db push` — apply ke remote
+- `supabase db diff` — auto-generate migrasi dari perubahan schema lokal
+
+### Branching (Pro plan)
+
+- Database branch per Git branch — preview environment per PR
+- Auto-merge migrasi saat PR di-merge
+
+### Tooling pendamping
+
+- `pg_dump` / `pg_restore` untuk backup
+- `postgrest` — REST API auto-generated dari schema
+- `pgmq` — message queue dalam Postgres
+- VS Code extension: Supabase + PostgreSQL
+
+Detail dan resep copy-paste akan ditambahkan saat journey ditulis.

@@ -1,0 +1,132 @@
+# GuardDuty
+
+**TL;DR**: Threat detection managed. Analyze CloudTrail event, VPC Flow Logs, DNS query, S3 data event, EKS audit log. Detect compromise credential, crypto-mining, command-and-control communication, anomalous behavior. Finding muncul dengan severity Low/Medium/High.
+
+## Analogi
+
+Sistem alarm rumah dengan motion sensor + door sensor + window sensor + AI yang bedakan kucing dari pencuri. AWS jaga, kamu cuma decide ngapain saat alarm bunyi.
+
+## Kapan pakai
+
+- ✅ Akun produksi yang punya data sensitif.
+- ✅ Akun dengan EC2 (mining hijack adalah common attack).
+- ✅ Compliance requirement (SOC 2, PCI-DSS sering minta IDS/IPS).
+- ✅ Multi-account org dengan delegated administrator.
+- ✅ Akun yang akses internet (egress monitoring).
+
+## Kapan jangan
+
+- ❌ Akun dev/test idle. Cost tidak worth.
+- ❌ Akun tanpa traffic atau resource. GuardDuty cost based on volume yang dianalisis.
+
+## Finding type contoh
+
+| Finding | Arti |
+|---|---|
+| `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration` | credential EC2 dipakai dari IP luar akun |
+| `CryptoCurrency:EC2/BitcoinTool.B` | EC2 instance kontak DNS pool mining |
+| `Persistence:IAMUser/AnomalousBehavior` | user bikin access key di luar pola normal |
+| `Backdoor:EC2/C&CActivity.B!DNS` | EC2 communicate ke C2 server known |
+| `Recon:IAMUser/MaliciousIPCaller` | API call dari IP threat-listed |
+| `PenTest:IAMUser/KaliLinux` | call dari Kali Linux fingerprint |
+| `Discovery:S3/AnomalousBehavior` | S3 bulk download di luar pola |
+
+Finding muncul dengan severity (Low/Medium/High) plus context detail (principal, IP, region, timestamp).
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| CloudTrail Management Event analysis | $0.0004 per event |
+| VPC Flow Log analysis | $1.00/GB |
+| DNS Query analysis | gratis |
+| S3 Protection (data event) | $0.10 per 1M event analyzed |
+| EKS Audit Log Protection | $0.10/GB analyzed |
+| Malware Protection EC2/EBS | $0.10 per scan + storage |
+| Runtime Monitoring (EKS, ECS, EC2) | $0.0017 per vCPU-hour |
+
+Akun small produksi: **$15-50/bulan typical**. Akun besar dengan S3 + EKS protection: ratusan dolar.
+
+Worth-it analysis: 1 incident security cost-nya jauh lebih besar (data breach $50k-100k, crypto hijack $1000-10000 sebelum di-detect).
+
+## Local emulator
+
+**Floci status**: ❌ gap
+
+Konseptual only. Untuk test full di staging account AWS asli.
+
+Alternatif open-source untuk threat detection lokal:
+- **Falco**: runtime security untuk container.
+- **Wazuh**: SIEM open source.
+- **Suricata**: IDS network-based.
+
+Tapi setup berbeda philosophy dari GuardDuty (yang fully managed).
+
+## Enable di AWS asli
+
+```bash
+# Enable di region current
+aws guardduty create-detector --enable
+
+# Bikin detector ID
+DETECTOR_ID=$(aws guardduty list-detectors --query 'DetectorIds[0]' --output text)
+
+# Enable S3 Protection
+aws guardduty update-detector \
+  --detector-id $DETECTOR_ID \
+  --data-sources S3Logs={Enable=true}
+
+# Enable EKS Protection
+aws guardduty update-detector \
+  --detector-id $DETECTOR_ID \
+  --data-sources Kubernetes={AuditLogs={Enable=true}}
+
+# Enable di SEMUA region (penting)
+for region in $(aws ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+  aws guardduty create-detector --enable --region $region
+done
+```
+
+### Integrate finding ke Slack via EventBridge
+
+```bash
+# Rule yang match finding HIGH severity
+aws events put-rule \
+  --name guardduty-high-severity \
+  --event-pattern '{
+    "source": ["aws.guardduty"],
+    "detail-type": ["GuardDuty Finding"],
+    "detail": { "severity": [{"numeric": [">", 7]}] }
+  }'
+
+# Target Lambda yang format dan POST ke Slack webhook
+aws events put-targets --rule guardduty-high-severity \
+  --targets "Id=1,Arn=arn:aws:lambda:us-east-1:xxx:function:slack-notify"
+```
+
+## Gotcha
+
+- **GuardDuty per region**: aktifkan di SEMUA region (termasuk yang tidak dipakai). Attacker bisa spin resource di region kosong tanpa terdeteksi.
+- **Finding noise minggu pertama**: SSH dari ISP rumah sering dianggap mencurigakan. Suppress via filter atau threat list.
+- **Severity tidak selalu accurate**: tweak skor di EventBridge filter. Mulai alert di HIGH (>7), turunkan ke MEDIUM (>4) setelah noise terkontrol.
+- **GuardDuty cuma detect, tidak block**: untuk auto-response, kombinasi dengan Lambda yang isolate instance, revoke key, dll.
+- **Trust IP list / Threat IP list**: upload sendiri list whitelist atau blacklist. Berguna untuk reduce false positive dari corporate IP.
+- **Cost VPC Flow Log analysis bisa kaget**: VPC dengan traffic tinggi = banyak flow log = mahal. Selective protection per VPC.
+- **EKS audit log per cluster opt-in**: protection cluster-by-cluster, tidak global.
+- **30-day finding retention**: setelah itu finding di-archive. Export ke S3 untuk long-term retention.
+- **Delegated administrator account**: di Organizations, designate 1 akun sebagai admin GuardDuty. Centralized view multi-account.
+- **Suppression rule penting**: tanpa suppression untuk known-benign finding (mis. team SSH dari office IP), alert fatigue cepat datang.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Defender for Cloud | broader (CSPM + threat detection) |
+| GCP | Security Command Center | broader, dengan vulnerability scan |
+| Self-hosted | Wazuh, Falco | open source SIEM/runtime |
+| Third-party | CrowdStrike, SentinelOne | endpoint protection enterprise |
+
+## Belajar lebih lanjut
+
+- Pakai GuardDuty di journey: [J11 Security Baseline](/id/aws/journeys/j11-security).
+- [AWS GuardDuty docs](https://docs.aws.amazon.com/guardduty/).

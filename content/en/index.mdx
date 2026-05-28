@@ -1,21 +1,35 @@
+import { ProviderCard, ProviderGrid } from '../../components/provider-card'
+
 # Cloud Docs
 
-Comprehensive cloud services documentation — AWS, Azure, GCP, Oracle — with insights, perfect use-cases, and local emulator setup.
+Cloud services documentation with insights, perfect use-cases, and local emulator setup. Bahasa Indonesia by default, English mirror best-effort.
+
+## Pick a Provider
+
+<ProviderGrid>
+  <ProviderCard
+    href="/en/aws"
+    title="AWS"
+    status="Active"
+    description="12 use-case journeys from static site to AI/ML inference. 30+ service references, floci emulator setup, fallback matrix."
+    meta="J1-J12 · 30+ services · floci.io"
+  />
+  <ProviderCard
+    href="/en/supabase"
+    title="Supabase"
+    status="Beta"
+    description="Postgres-based BaaS with Auth, Storage, Realtime, Edge Functions, and pgvector. Skeleton, content in progress."
+    meta="WIP · local dev via supabase CLI"
+  />
+</ProviderGrid>
 
 ## Philosophy
 
 - **Use-case journey first**: learn services in real context, not alphabetical lists.
-- **Local-first**: each journey runs on your laptop via emulator ([floci.io](https://floci.io) for AWS).
-- **Cross-provider**: every concept maps to all providers — switching cloud isn't starting over.
+- **Local-first**: each journey runs on your laptop via emulator (floci for AWS, `supabase start` for Supabase).
+- **Cross-provider**: every concept maps to other providers, switching cloud isn't starting over.
 - **Bilingual**: Bahasa Indonesia by default, English mirror.
-
-## Where to start
-
-- New to cloud? → [Foundation](/en/foundation)
-- Want to build something? → [Use-Case Journeys](/en/journeys)
-- Looking for a specific service? → [Service Reference](/en/services)
-- Set up local emulator? → [Tools & Emulator](/en/tools)
 
 ## Status
 
-Project in active development. Early phase focuses on AWS (J1-J12). Azure, GCP, Oracle to follow.
+Project in active development. Early phase focuses on AWS (J1-J12 done, 30+ service reference pages). Supabase is a skeleton. Azure, GCP, Oracle to follow.

@@ -1,0 +1,24 @@
+# Service Reference Supabase
+
+> **Skeleton.** Tiap service akan ikut template halaman service: TL;DR, analogi, perfect use-case, anti use-case, pricing mental model, local emulator, hello-world, gotcha, cross-provider.
+
+## Service target
+
+- **Database** (Postgres 15 + ekstensi pilihan: pgvector, pg_cron, pgmq, pgaudit, dll)
+- **Auth** (GoTrue: email/password, OAuth provider, MFA, magic link)
+- **Storage** (S3-compatible object storage + image transform)
+- **Edge Functions** (Deno runtime, deploy global)
+- **Realtime** (Postgres CDC, broadcast, presence)
+- **Vector** (pgvector ekstensi + similarity search)
+- **Studio** (dashboard untuk DB, auth, storage, function)
+
+Cross-provider mapping (preview):
+
+| Capability | Supabase | AWS | Azure | GCP |
+|---|---|---|---|---|
+| Managed Postgres | Database | RDS PG | Azure DB for PG | Cloud SQL |
+| Object storage | Storage | S3 | Blob Storage | Cloud Storage |
+| Serverless function | Edge Function | Lambda | Functions | Cloud Run |
+| Identity | Auth | Cognito | Entra ID B2C | Identity Platform |
+| Realtime | Realtime | AppSync / IoT Core | SignalR | Firestore listeners |
+| Vector | pgvector | OpenSearch / Bedrock KB | AI Search | Vertex Vector |

@@ -1,0 +1,140 @@
+# Kinesis Data Streams
+
+**TL;DR**: Real-time data streaming service. Producer write record ke stream, multiple consumer baca paralel dengan replay capability (retention 24 jam sampai 365 hari). Pakai untuk event stream high-throughput, clickstream, log ingestion, IoT telemetry.
+
+## Analogi
+
+Conveyor belt di pabrik. Producer taruh barang, consumer ambil dari posisi tertentu. Bisa pause/rewind, beda dari queue yang sekali ambil hilang.
+
+## Kapan pakai
+
+- ✅ Ingest event volume tinggi (10k+ event/detik).
+- ✅ Multiple consumer baca data sama dengan independent progress (mis. analytics + ML training + archive paralel).
+- ✅ Replay event setelah bug fix di consumer.
+- ✅ Real-time analytics dashboard.
+- ✅ Log aggregation centralized.
+- ✅ Clickstream tracking.
+
+## Kapan jangan
+
+- ❌ Simple async task processing 1 consumer. Pakai SQS.
+- ❌ Pub/sub fanout sederhana. Pakai SNS atau EventBridge.
+- ❌ Workload spiky tidak prediktabel. On-demand mode bantu, tapi cek cost dulu.
+- ❌ Pesan rare (< 100/jam). Overhead Kinesis tidak worth.
+
+## Konsep
+
+| Term | Arti |
+|---|---|
+| **Stream** | logical pipe of records, terdiri dari 1+ shard |
+| **Shard** | unit throughput: 1 MB/s atau 1000 record/s write, 2 MB/s read |
+| **Record** | data unit (max 1 MB), berisi data + partition key + sequence number |
+| **Partition key** | menentukan record masuk shard mana |
+| **Consumer** | app yang read stream, track progress via checkpoint |
+| **Iterator** | position cursor di shard (latest, oldest, after sequence, timestamp) |
+
+## Pricing mental model
+
+### Provisioned mode
+
+| Komponen | Harga (us-east-1) |
+|---|---|
+| Shard hour | $0.015/jam ($11/bulan per shard) |
+| PUT payload unit | $0.014 per 1M (1 unit = 25 KB) |
+| Extended retention (> 24 jam) | $0.020/shard/jam (24h-7d), $0.024/shard/jam (>7d) |
+| Enhanced fan-out consumer | $0.015/shard/jam per consumer + $0.013/GB |
+
+Cost 1 shard 24/7 = $11/bulan minimum.
+
+### On-demand mode
+
+| Komponen | Harga |
+|---|---|
+| Per GB written | $0.040 |
+| Per GB read (default consumer) | gratis |
+| Per shard-hour managed AWS | implicit dalam GB cost |
+
+Cocok traffic tidak prediktabel. Lebih mahal di steady high-throughput, lebih murah di bursty.
+
+## Local emulator
+
+**Floci status**: ✅ full
+
+```bash
+awsl kinesis create-stream --stream-name events --shard-count 1
+awsl kinesis wait stream-exists --stream-name events
+```
+
+## Hello-world
+
+```bash
+STREAM=events
+
+# Put record
+awsl kinesis put-record \
+  --stream-name $STREAM \
+  --data "$(echo -n '{"user_id":"u1","action":"click"}' | base64)" \
+  --partition-key u1
+
+# Get shard iterator (start from latest)
+ITERATOR=$(awsl kinesis get-shard-iterator \
+  --stream-name $STREAM \
+  --shard-id shardId-000000000000 \
+  --shard-iterator-type TRIM_HORIZON \
+  --query 'ShardIterator' --output text)
+
+# Read record
+awsl kinesis get-records --shard-iterator $ITERATOR --limit 10
+```
+
+Dari Lambda (auto-consume via event source mapping):
+
+```bash
+awsl lambda create-event-source-mapping \
+  --function-name process-events \
+  --event-source-arn arn:aws:kinesis:us-east-1:000000000000:stream/events \
+  --starting-position LATEST \
+  --batch-size 100
+```
+
+Lambda terima batch record otomatis, checkpoint progress otomatis.
+
+## Kinesis vs SQS vs MSK (Kafka)
+
+| Faktor | Kinesis | SQS | MSK (Kafka) |
+|---|---|---|---|
+| Replay | iya | tidak | iya |
+| Multiple consumer | iya | tidak (1 per pesan) | iya |
+| Ordering | per shard | per FIFO group | per partition |
+| Throughput per shard/partition | 1 MB/s in, 2 MB/s out | unlimited | unlimited per broker |
+| Cost per juta | $0.014 PUT | $0.40 message | flat broker cost |
+| Operational complexity | rendah | rendah | tinggi (kalau self-manage) |
+| Setup time | menit | menit | jam-hari |
+
+## Gotcha
+
+- **Partition key menentukan shard**: key yang sama → shard yang sama → ordered. Key yang skewed → hot shard → bottleneck.
+- **Hot shard limit**: 1 shard cuma 1000 record/s write. Traffic > limit kena `ProvisionedThroughputExceededException`. Pakai random partition key untuk distribute, atau tambah shard.
+- **Resharding lambat**: scale up shard via `update-shard-count` bisa puluhan detik. Plan capacity di muka untuk traffic spike yang sudah terprediksi.
+- **At-least-once delivery**: consumer bisa baca record sama dua kali. Harus idempotent.
+- **Retention default 24 jam**: setelah itu record hilang. Untuk replay panjang, perpanjang retention (mahal).
+- **Lambda consumer checkpoint per batch**: kalau Lambda crash setelah process tapi sebelum checkpoint, batch sama di-re-deliver.
+- **PutRecord vs PutRecords batch**: batch hemat API call (50% cost reduction). Sampai 500 record per call.
+- **Enhanced fan-out untuk multi-consumer**: default consumer share 2 MB/s read per shard. Untuk dedicated throughput per consumer, pakai enhanced fan-out (mahal).
+- **Aggregation library KCL**: native Kinesis library buat producer batch + consumer dengan KPL/KCL. Lebih efisien dari raw SDK, tapi rumit setup.
+- **On-demand mode tidak instant scale**: butuh 15 menit untuk double throughput. Bukan true serverless dari latency perspective.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Event Hubs | Kafka-compatible API |
+| GCP | Pub/Sub | hybrid streaming + queue |
+| GCP | Dataflow | stream processing |
+| Self-hosted | Apache Kafka, Redpanda | open source |
+| Floci (built-in) | MSK via Redpanda | bisa pakai sebagai alternative Kinesis di lokal |
+
+## Belajar lebih lanjut
+
+- Pakai Kinesis di journey: [J7 Data Pipeline](/id/aws/journeys/j7-data-pipeline).
+- [AWS Kinesis docs](https://docs.aws.amazon.com/kinesis/).

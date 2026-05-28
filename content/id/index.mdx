@@ -1,21 +1,35 @@
+import { ProviderCard, ProviderGrid } from '../../components/provider-card'
+
 # Cloud Docs
 
-Dokumentasi cloud services komprehensif — AWS, Azure, GCP, Oracle — dengan insight, perfect use-case, dan local emulator setup.
+Dokumentasi cloud services dengan insight, perfect use-case, dan setup emulator lokal. Bahasa Indonesia default, English mirror best-effort.
+
+## Pilih Provider
+
+<ProviderGrid>
+  <ProviderCard
+    href="/id/aws"
+    title="AWS"
+    status="Active"
+    description="12 use-case journey lengkap dari static site sampai AI/ML inference. 30+ service reference, floci emulator setup, fallback matrix."
+    meta="J1-J12 · 30+ services · floci.io"
+  />
+  <ProviderCard
+    href="/id/supabase"
+    title="Supabase"
+    status="Beta"
+    description="Postgres-based BaaS dengan Auth, Storage, Realtime, Edge Function, dan pgvector. Skeleton baru, konten nyusul."
+    meta="WIP · local dev via supabase CLI"
+  />
+</ProviderGrid>
 
 ## Filosofi
 
 - **Use-case journey first**: kamu belajar service ketika butuh di konteks nyata, bukan daftar abjad.
-- **Local-first**: tiap journey runnable di laptop pakai emulator ([floci.io](https://floci.io) untuk AWS).
-- **Cross-provider**: tiap konsep punya mapping ke semua provider — pindah cloud tidak start from zero.
+- **Local-first**: tiap journey runnable di laptop pakai emulator (floci untuk AWS, `supabase start` untuk Supabase).
+- **Cross-provider**: tiap konsep punya mapping ke provider lain, pindah cloud tidak start from zero.
 - **Bilingual**: Bahasa Indonesia default, English mirror.
-
-## Mulai dari mana?
-
-- Baru kenal cloud? → [Fondasi](/id/foundation)
-- Mau bikin sesuatu? → [Use-Case Journey](/id/journeys)
-- Cari service spesifik? → [Service Reference](/id/services)
-- Setup emulator lokal? → [Tools & Emulator](/id/tools)
 
 ## Status
 
-Project ini in active development. Fase awal fokus AWS (J1-J12). Azure, GCP, Oracle menyusul.
+Project ini in active development. Fase awal fokus AWS (J1-J12 selesai, service reference 30+ pages). Supabase baru skeleton. Azure, GCP, Oracle menyusul.

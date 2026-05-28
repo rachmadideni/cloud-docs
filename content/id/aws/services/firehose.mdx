@@ -1,0 +1,128 @@
+# Data Firehose (former Kinesis Firehose)
+
+**TL;DR**: Managed delivery service. Source: Kinesis Stream atau Direct PUT. Destination: S3, Redshift, OpenSearch, Splunk, HTTP. Batch + buffer + format conversion (JSON ke Parquet). Tanpa server, tanpa code.
+
+## Analogi
+
+Conveyor belt automation di pabrik yang sort dan pack barang sebelum kirim ke gudang. Tidak peduli barang masuk berapa cepat, output sudah dipack dengan format dan ukuran tertentu.
+
+## Kapan pakai
+
+- ✅ Deliver event stream ke S3 sebagai data lake.
+- ✅ Convert JSON ke Parquet otomatis (hemat storage, faster Athena query).
+- ✅ Batch event sebelum write ke OpenSearch (reduce write request).
+- ✅ Send log ke Splunk atau third-party SIEM.
+- ✅ Backup Kinesis stream ke S3 untuk archive.
+
+## Kapan jangan
+
+- ❌ Real-time delivery (latency lebih rendah dari 60 detik). Pakai Lambda subscribe Kinesis langsung.
+- ❌ Custom processing logic kompleks. Pakai Lambda atau Glue.
+- ❌ Bidirectional sync. Firehose cuma one-way.
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| Data ingested | $0.029/GB |
+| Format conversion (JSON to Parquet) | $0.018/GB |
+| Delivery ke S3 | gratis (cuma data ingested) |
+| Delivery ke Redshift / OpenSearch | tambahan kecil per GB |
+| VPC delivery | tambahan |
+
+Untuk 50 GB/bulan JSON ke Parquet: 50 × ($0.029 + $0.018) = $2.35/bulan.
+
+## Local emulator
+
+**Floci status**: ✅ full
+
+```bash
+awsl firehose create-delivery-stream \
+  --delivery-stream-name to-s3 \
+  --delivery-stream-type DirectPut \
+  --extended-s3-destination-configuration '{
+    "BucketARN": "arn:aws:s3:::data-lake",
+    "Prefix": "events/year=!{timestamp:yyyy}/month=!{timestamp:MM}/day=!{timestamp:dd}/",
+    "ErrorOutputPrefix": "errors/",
+    "BufferingHints": {"SizeInMBs": 5, "IntervalInSeconds": 60},
+    "CompressionFormat": "UNCOMPRESSED",
+    "RoleARN": "arn:aws:iam::000000000000:role/firehose-role"
+  }'
+```
+
+## Hello-world
+
+### Source: Direct PUT
+
+```bash
+awsl firehose put-record \
+  --delivery-stream-name to-s3 \
+  --record "Data=$(echo -n '{"user_id":"u1","action":"click"}' | base64)"
+```
+
+Tunggu 60 detik (buffer interval). File appear di S3 dengan path `events/year=2026/month=05/day=27/`.
+
+### Source: Kinesis Stream
+
+```bash
+# Subscribe Firehose ke Kinesis stream
+awsl firehose create-delivery-stream \
+  --delivery-stream-name from-kinesis-to-s3 \
+  --delivery-stream-type KinesisStreamAsSource \
+  --kinesis-stream-source-configuration '{
+    "KinesisStreamARN": "arn:aws:kinesis:us-east-1:000000000000:stream/events",
+    "RoleARN": "arn:aws:iam::000000000000:role/firehose-role"
+  }' \
+  --extended-s3-destination-configuration '{...}'
+```
+
+Firehose otomatis poll stream, batch, deliver. Tanpa code consumer.
+
+### Format conversion JSON ke Parquet
+
+Tambah di destination config:
+
+```json
+"DataFormatConversionConfiguration": {
+  "SchemaConfiguration": {
+    "DatabaseName": "analytics",
+    "TableName": "events",
+    "RoleARN": "..."
+  },
+  "InputFormatConfiguration": {
+    "Deserializer": { "OpenXJsonSerDe": {} }
+  },
+  "OutputFormatConfiguration": {
+    "Serializer": { "ParquetSerDe": {} }
+  },
+  "Enabled": true
+}
+```
+
+Glue catalog harus punya schema yang sesuai. File output di S3 sebagai Parquet, ready untuk Athena query.
+
+## Gotcha
+
+- **Latency minimum 60 detik**: BufferingHints minimum 60s. Tidak cocok real-time.
+- **Buffer size atau interval, mana lebih dulu**: Firehose flush kalau salah satu tercapai (5 MB atau 60 detik). Set lebih besar untuk traffic rendah supaya tidak generate file kecil banyak.
+- **Small file problem**: traffic rendah generate ratusan file kecil per hari. Hemat S3 storage tapi mahal Athena scan. Compaction job manual.
+- **Format conversion butuh schema fix**: field baru di event yang tidak ada di Glue schema = di-drop saat konversi. Update schema dulu.
+- **No retry built-in untuk Direct PUT**: Direct PUT cuma 1 attempt. Producer harus retry sendiri kalau API call fail.
+- **Error output prefix wajib**: kalau record gagal convert, masuk `ErrorOutputPrefix/`. Setup biar tidak lost.
+- **Lambda data transformation optional**: bisa attach Lambda yang transform record sebelum delivery. Lambda invocation cost ekstra. Lebih simpel pakai Glue ETL kalau transformation kompleks.
+- **Subscription filter dari CloudWatch Logs**: Firehose bisa langsung consume CloudWatch Log group, deliver ke S3. Pattern umum: log Lambda → CloudWatch → Firehose → S3 → Athena.
+- **Compression vs Parquet**: pakai salah satu. Parquet sudah built-in compression (Snappy). Jangan tambah gzip di atasnya.
+- **VPC delivery butuh ENI**: deliver ke OpenSearch atau Redshift di VPC butuh Firehose buat ENI di subnet. Cost ENI plus setup security group.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Event Hubs Capture | mirip, auto capture ke Blob/Data Lake |
+| GCP | Dataflow + Pub/Sub | manual pipeline |
+| Self-hosted | Logstash, Vector, Fluent Bit | open source, full control |
+
+## Belajar lebih lanjut
+
+- Pakai Firehose di journey: [J7 Data Pipeline](/id/aws/journeys/j7-data-pipeline).
+- [AWS Data Firehose docs](https://docs.aws.amazon.com/firehose/).

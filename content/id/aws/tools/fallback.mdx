@@ -1,0 +1,375 @@
+# Fallback Matrix
+
+Service AWS yang **tidak** di-cover Floci, plus alternatif lokal dengan compose snippet ready-to-copy.
+
+## Ringkasan gap
+
+| Service | Status | Alternatif lokal | Saat production (di luar lokal) |
+|---|---|---|---|
+| CloudFront | ❌ | nginx reverse proxy | tetap CloudFront di AWS |
+| Rekognition | ❌ | stub manual / sharp lokal | Rekognition asli |
+| X-Ray | ❌ | Jaeger + OpenTelemetry | X-Ray atau pakai OTel ke vendor lain |
+| GuardDuty | ❌ | konseptual, atau Wazuh self-host | GuardDuty asli |
+| Inspector | ❌ | konseptual, atau Trivy + Snyk | Inspector asli |
+| Macie | ❌ | konseptual, atau Presidio | Macie asli |
+| Bedrock LLM | ⚠️ stub | Ollama | Bedrock asli |
+| SageMaker training | ❌ | Jupyter lokal / Colab | SageMaker asli |
+| WAF, Shield | ❌ | konseptual | WAF + Shield Standard built-in di CloudFront/ALB |
+| SES delivery aktual | ⚠️ | Mailpit / MailHog | SES asli |
+
+## CloudFront → nginx reverse proxy
+
+CloudFront utama untuk: CDN cache + HTTPS termination + path/host routing. nginx cover semua di lokal.
+
+```yaml
+# docker-compose.yml snippet
+services:
+  nginx:
+    image: nginx:alpine
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+```
+
+```nginx
+# nginx.conf
+events {}
+
+http {
+  proxy_cache_path /tmp/cache levels=1:2 keys_zone=cdn:10m max_size=100m;
+
+  server {
+    listen 443 ssl;
+    server_name app.local;
+
+    ssl_certificate     /etc/nginx/certs/app.local.crt;
+    ssl_certificate_key /etc/nginx/certs/app.local.key;
+
+    location / {
+      proxy_pass http://host.docker.internal:4566/my-bucket/;
+      proxy_cache cdn;
+      proxy_cache_valid 200 1m;
+      add_header X-Cache $upstream_cache_status;
+    }
+  }
+}
+```
+
+Cert pakai `mkcert`:
+
+```bash
+mkcert -install
+mkcert -cert-file certs/app.local.crt -key-file certs/app.local.key app.local
+```
+
+Edit `/etc/hosts` (Linux/Mac) atau `C:\Windows\System32\drivers\etc\hosts`:
+```
+127.0.0.1   app.local
+```
+
+Pattern lengkap di [J1 Static Site](/id/aws/journeys/j1-static-site).
+
+## X-Ray → Jaeger + OpenTelemetry
+
+X-Ray AWS = distributed tracing. Jaeger open source = sama konsep, lebih portable. OpenTelemetry SDK adalah vendor-neutral instrumentation.
+
+```yaml
+services:
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    ports:
+      - '16686:16686'   # UI
+      - '4317:4317'     # OTLP gRPC
+      - '4318:4318'     # OTLP HTTP
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+```
+
+Akses UI: `http://localhost:16686`.
+
+Code (Node):
+
+```js
+const { NodeSDK } = require('@opentelemetry/sdk-node')
+const { OTLPTraceExporter } = require('@opentelemetry/exporter-trace-otlp-http')
+
+new NodeSDK({
+  traceExporter: new OTLPTraceExporter({
+    url: process.env.OTEL_EXPORTER_OTLP_ENDPOINT || 'http://jaeger:4318/v1/traces'
+  })
+}).start()
+```
+
+Saat deploy AWS, ganti exporter ke X-Ray atau pakai AWS Distro for OpenTelemetry (ADOT) Lambda layer. Code tidak perlu rewrite. Pattern di [J10 Observability](/id/aws/journeys/j10-observability).
+
+## Rekognition → stub manual atau sharp
+
+Rekognition cover: image moderation, label detection, OCR, face match. Alternatif lokal:
+
+### Stub random (untuk dev pipeline)
+
+```js
+// di Lambda moderation handler
+async function detectLabels(bucket, key) {
+  // STUB: random 90% approve
+  const approved = Math.random() > 0.1
+  return {
+    flagged: !approved,
+    labels: approved ? ['Person', 'Outdoor'] : ['ExplicitContent']
+  }
+}
+```
+
+Saat AWS asli, ganti dengan SDK call:
+
+```js
+const { RekognitionClient, DetectModerationLabelsCommand } =
+  require('@aws-sdk/client-rekognition')
+const rek = new RekognitionClient({ region: 'us-east-1' })
+
+async function detectLabels(bucket, key) {
+  const res = await rek.send(new DetectModerationLabelsCommand({
+    Image: { S3Object: { Bucket: bucket, Name: key } },
+    MinConfidence: 70
+  }))
+  return {
+    flagged: res.ModerationLabels.length > 0,
+    labels: res.ModerationLabels.map(l => l.Name)
+  }
+}
+```
+
+### sharp untuk image processing (bukan moderation)
+
+`sharp` (Node) atau `Pillow` (Python) handle resize, format conversion, metadata extraction. Bukan moderation, tapi cover 80% use case "image processing".
+
+```bash
+npm install sharp
+```
+
+```js
+const sharp = require('sharp')
+const thumbnail = await sharp(input)
+  .resize(200, 200, { fit: 'cover' })
+  .jpeg({ quality: 80 })
+  .toBuffer()
+```
+
+## Bedrock LLM → Ollama
+
+Ollama run LLM open source di laptop. API mirip OpenAI format. Swap antara Ollama dan Bedrock via env var.
+
+```yaml
+services:
+  ollama:
+    image: ollama/ollama:latest
+    ports: ['11434:11434']
+    volumes:
+      - ollama-data:/root/.ollama
+
+volumes:
+  ollama-data:
+```
+
+Pull model:
+
+```bash
+docker exec -it $(docker ps -qf "ancestor=ollama/ollama") ollama pull llama3.2:1b
+docker exec -it $(docker ps -qf "ancestor=ollama/ollama") ollama pull nomic-embed-text
+```
+
+Test:
+
+```bash
+curl http://localhost:11434/api/generate -d '{
+  "model": "llama3.2:1b",
+  "prompt": "Apa itu AWS Lambda?",
+  "stream": false
+}'
+```
+
+Code abstraction:
+
+```js
+async function callLLM(prompt) {
+  if (process.env.USE_BEDROCK === 'true') {
+    return await callBedrock(prompt)
+  }
+  return await callOllama(prompt)
+}
+```
+
+Detail di [J12 AI/ML](/id/aws/journeys/j12-ai-ml).
+
+### Vector DB untuk RAG
+
+Qdrant atau Chroma sebagai vector store lokal:
+
+```yaml
+services:
+  qdrant:
+    image: qdrant/qdrant:latest
+    ports: ['6333:6333']
+    volumes:
+      - qdrant-data:/qdrant/storage
+
+  # atau ChromaDB
+  chroma:
+    image: chromadb/chroma:latest
+    ports: ['8000:8000']
+    volumes:
+      - chroma-data:/chroma/chroma
+```
+
+Saat AWS asli, swap ke OpenSearch Serverless atau Aurora pgvector atau Bedrock Knowledge Bases.
+
+## GuardDuty / Inspector / Macie → konseptual
+
+Tiga service threat detection AWS tidak punya pengganti lokal yang setara. Untuk lokal:
+
+- **GuardDuty alternatif (security monitoring)**: Wazuh self-host, Falco untuk container runtime.
+- **Inspector alternatif (vulnerability scan)**: Trivy (image scan), Snyk, Grype.
+- **Macie alternatif (PII detection)**: Presidio (Microsoft open source).
+
+```yaml
+# Wazuh stack (lumayan berat, untuk dev sebaiknya skip)
+services:
+  wazuh-manager:
+    image: wazuh/wazuh-manager:4.7.0
+    ports: ['1514:1514/udp', '55000:55000']
+```
+
+```bash
+# Trivy scan Docker image
+docker run --rm -v /var/run/docker.sock:/var/run/docker.sock \
+  aquasec/trivy image my-app:latest
+
+# Presidio PII detection
+docker run -p 5002:5002 mcr.microsoft.com/presidio-analyzer
+```
+
+Untuk test logic moderation/detection di pipeline, pakai stub yang return finding palsu. Saat produksi, switch ke GuardDuty/Inspector/Macie via env var atau feature flag.
+
+## SES delivery → Mailpit
+
+SES API ada di Floci, tapi email tidak benar-benar dikirim. Mailpit catch email yang aplikasi kirim, tampilkan di UI web.
+
+```yaml
+services:
+  mailpit:
+    image: axllent/mailpit:latest
+    ports:
+      - '1025:1025'   # SMTP
+      - '8025:8025'   # UI
+```
+
+Setup SES SDK ke endpoint Floci, atau pakai SMTP langsung ke Mailpit:
+
+```js
+const nodemailer = require('nodemailer')
+
+const transporter = nodemailer.createTransport({
+  host: process.env.SMTP_HOST || 'mailpit',
+  port: 1025,
+  secure: false
+})
+
+await transporter.sendMail({
+  from: 'app@example.com',
+  to: 'user@example.com',
+  subject: 'Hello',
+  text: 'Email content'
+})
+```
+
+Buka `http://localhost:8025` untuk lihat email yang dikirim.
+
+## SageMaker → Jupyter / Colab
+
+Untuk eksperimen ML tanpa AWS asli:
+
+- **Jupyter Notebook lokal**: install Python + scikit-learn / TensorFlow / PyTorch.
+- **Colab** gratis dengan GPU terbatas.
+- **Kaggle Notebooks** gratis dengan GPU + TPU.
+
+```yaml
+services:
+  jupyter:
+    image: jupyter/datascience-notebook:latest
+    ports: ['8888:8888']
+    volumes:
+      - ./notebooks:/home/jovyan/work
+    environment:
+      JUPYTER_TOKEN: dev-token
+```
+
+Untuk training serius (multi-GPU, distributed), tidak ada alternatif lokal yang fit. Pakai SageMaker di AWS asli (atau provider GPU lain seperti Lambda Labs, RunPod).
+
+## WAF / Shield → konseptual
+
+WAF AWS = web application firewall layer 7. Tidak ada alternatif lokal yang real.
+
+Test pattern aja:
+- Mock attack di staging account.
+- Pakai OWASP ZAP untuk pen-test app sebelum deploy.
+
+```bash
+docker run -p 8080:8080 -p 8090:8090 \
+  -v $(pwd):/zap/wrk/:rw \
+  owasp/zap2docker-stable zap-baseline.py \
+  -t http://app.local \
+  -r zap-report.html
+```
+
+## Stack lengkap (combine semua)
+
+Master compose untuk dev environment full-fledged:
+
+```yaml
+services:
+  floci:
+    image: floci/floci:latest
+    ports: ['4566:4566']
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+
+  nginx:                # CloudFront fallback
+    image: nginx:alpine
+    ports: ['80:80', '443:443']
+    volumes:
+      - ./nginx.conf:/etc/nginx/nginx.conf:ro
+      - ./certs:/etc/nginx/certs:ro
+
+  jaeger:               # X-Ray fallback
+    image: jaegertracing/all-in-one:latest
+    ports: ['16686:16686', '4317:4317', '4318:4318']
+    environment:
+      COLLECTOR_OTLP_ENABLED: 'true'
+
+  ollama:               # Bedrock fallback
+    image: ollama/ollama:latest
+    ports: ['11434:11434']
+    volumes: [ollama-data:/root/.ollama]
+
+  qdrant:               # Vector DB
+    image: qdrant/qdrant:latest
+    ports: ['6333:6333']
+    volumes: [qdrant-data:/qdrant/storage]
+
+  mailpit:              # SES fallback
+    image: axllent/mailpit:latest
+    ports: ['1025:1025', '8025:8025']
+
+volumes:
+  ollama-data:
+  qdrant-data:
+```
+
+Pakai sesuai kebutuhan per journey. Tidak perlu semua kalau cuma butuh subset. Lihat [Compose Recipes](/id/aws/tools/compose-recipes) untuk versi per-journey.
+
+## Belajar lebih lanjut
+
+- Setup awal Floci: [Floci](/id/aws/tools/floci).
+- Compose lengkap per journey: [Compose Recipes](/id/aws/tools/compose-recipes).
+- Daily workflow: [Dev Workflow](/id/aws/tools/dev-workflow).
