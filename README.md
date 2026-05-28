@@ -54,7 +54,7 @@ Auto-deploy on push to `main` via Cloudflare Pages git integration.
 1. Push repo to GitHub.
 2. Cloudflare dashboard → Workers & Pages → Create → Pages → Connect to Git → pick repo.
 3. Build configuration:
-   - Framework preset: **Next.js (Static HTML Export)**
+   - Framework preset: **None** (jangan pilih "Next.js", lihat DEPLOY.md untuk alasan)
    - Build command: `npm run build`
    - Build output directory: `out`
    - Root directory: `/`

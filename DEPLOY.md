@@ -38,10 +38,12 @@ Cek di GitHub web UI bahwa file masuk semua. `.env` harus TIDAK ada (di-gitignor
 |---|---|
 | **Project name** | `cloud-docs` (akan jadi `cloud-docs.pages.dev`) |
 | **Production branch** | `main` |
-| **Framework preset** | **Next.js (Static HTML Export)** |
+| **Framework preset** | **None** (JANGAN pilih "Next.js") |
 | **Build command** | `npm run build` |
 | **Build output directory** | `out` |
 | **Root directory** | `/` (default) |
+
+> ⚠️ **Penting**: pilih **None**, bukan "Next.js". Preset "Next.js" akan trigger `@cloudflare/next-on-pages` adapter yang expect server runtime + `.next/standalone` output. Project ini pakai `output: 'export'` (static), output ada di `out/`, bukan `.next/`. Salah preset = build fail dengan error `ENOENT: pages-manifest.json`.
 
 ### Environment variables
 
@@ -141,6 +143,10 @@ Tab **Deployments** → cari versi lama yang work → klik **...** → **Rollbac
 Instant rollback, no rebuild.
 
 ## Troubleshooting
+
+### Build fail dengan ENOENT pages-manifest.json
+
+Framework preset salah. Set ke **None** (bukan "Next.js"). Detail di Step 3 di atas.
 
 ### Build sukses tapi page 404
 
