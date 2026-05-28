@@ -9,7 +9,7 @@
 | Kong (API gateway) | 54321 | http://127.0.0.1:54321 | Entry point semua API call. Routing ke gotrue, postgrest, storage, realtime, edge function. |
 | Postgres | 54322 | postgresql://postgres:postgres@127.0.0.1:54322/postgres | Database utama, Postgres 17. Connect pakai client SQL apa pun. |
 | Studio | 54323 | http://127.0.0.1:54323 | Dashboard web. Schema explorer, SQL editor, auth user list, storage browser. |
-| Inbucket | 54324 | http://127.0.0.1:54324 | Fake SMTP. Email signup, magic link, reset password masuk ke sini, tidak ke email beneran. |
+| Inbucket / Mailpit | 54324 | http://127.0.0.1:54324 | Fake SMTP. Email signup, magic link, reset password masuk ke sini, tidak ke email beneran. Lihat [catatan transisi](#inbucket-vs-mailpit) di bawah. |
 | Analytics | 54327 | http://127.0.0.1:54327 | Logflare backend untuk log container. Jarang dibuka langsung. |
 | Pooler (Supavisor) | 54329 | postgresql://postgres:postgres@127.0.0.1:54329/postgres | Connection pooler. Disabled default lokal, aktifkan kalau ngetes pooling. |
 
@@ -32,8 +32,22 @@ Service support yang tidak di-expose lewat Kong:
 
 - `imgproxy`: resize image dari Storage, auto on-demand
 - `postgres-meta`: API metadata Postgres untuk Studio
-- `mailpit`: alt SMTP yang lebih modern dari Inbucket
 - `vector`: log collector untuk analytics
+
+## Inbucket vs Mailpit
+
+Catatan kecil tapi sering bikin bingung. Supabase CLI versi terbaru (2.x) sebenarnya jalanin container **Mailpit** sebagai SMTP catcher, bukan Inbucket. Tapi config key di `config.toml` masih pakai `[inbucket]` untuk backward compatibility.
+
+| Hal | Status |
+|---|---|
+| Config key di `config.toml` | `[inbucket]` (legacy, tetap dipakai) |
+| Container yang spawn | `mailpit` (current) |
+| Port UI | 54324 (sama) |
+| Behavior dari user | identik |
+
+Service inventory resmi Supabase sekarang nyebut `mailpit`. Kalau ada dokumentasi atau diskusi yang sebut "Mailpit" dan kamu liat `[inbucket]` di config, itu hal yang sama. Cukup tahu kalau yang muncul di `docker ps` mungkin `supabase_mailpit_<project>`, bukan `supabase_inbucket_<project>`.
+
+Untuk halaman ini selanjutnya, kami sebut "Inbucket" karena itu nama yang muncul di `config.toml` dan dokumentasi resmi yang reader paling sering lihat.
 
 ## Container check
 
