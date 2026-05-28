@@ -1,0 +1,285 @@
+# Workflow
+
+Setelah local stack jalan, tiga workflow yang kamu pakai tiap hari: ubah schema, generate types, deploy edge function. Halaman ini bedah satu-satu, ada gotcha-nya.
+
+## Schema change dan migrasi
+
+Aturan main: jangan edit schema lewat Studio production. Edit di lokal, generate migrasi, commit, lalu push. Studio cuma untuk eksplorasi dan ad-hoc query.
+
+### Pola dasar
+
+```bash
+# 1. Ubah schema lokal (lewat Studio atau SQL langsung)
+psql postgresql://postgres:postgres@127.0.0.1:54322/postgres
+# CREATE TABLE notes (id uuid primary key, content text);
+
+# 2. Generate file migrasi dari perubahan
+supabase db diff -f add_notes_table
+
+# 3. Cek isi file
+cat supabase/migrations/<timestamp>_add_notes_table.sql
+
+# 4. Test ulang dari nol
+supabase db reset
+
+# 5. Push ke remote
+supabase db push
+```
+
+`supabase db diff` bandingin schema database lokal dengan kumpulan migrasi yang sudah ada, dump perbedaannya ke file SQL baru. Flag `-f <name>` kasih nama deskriptif, kalau tidak, default `nameless_migration`.
+
+### Bikin migrasi manual
+
+Kalau perubahan kompleks (mis. data migration + schema change), bikin migrasi manual, lebih aman daripada diff:
+
+```bash
+supabase migration new add_notes_with_seed
+```
+
+Edit file yang dibuat di `supabase/migrations/<timestamp>_add_notes_with_seed.sql`:
+
+```sql
+create table notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
+  content text not null,
+  created_at timestamptz default now()
+);
+
+alter table notes enable row level security;
+
+create policy "users see own notes"
+  on notes for select
+  using (auth.uid() = user_id);
+
+create policy "users insert own notes"
+  on notes for insert
+  with check (auth.uid() = user_id);
+
+-- Seed data
+insert into notes (user_id, content) values
+  ('00000000-0000-0000-0000-000000000001', 'sample note');
+```
+
+Apply lokal:
+
+```bash
+supabase db reset    # drop + recreate + apply semua migrasi + seed
+```
+
+### Reset vs Push
+
+`supabase db reset` (lokal): drop schema, apply ulang semua migrasi dari nol, lalu jalankan `seed.sql`. Pakai ini untuk verify migrasi end-to-end di lokal sebelum push.
+
+`supabase db push` (remote): apply migrasi yang belum ada di remote ke project Supabase production. Idempotent berdasarkan timestamp file migrasi.
+
+```bash
+# Link ke project remote (sekali)
+supabase link --project-ref <project-id>
+
+# Push migrasi
+supabase db push
+
+# Dry-run dulu kalau ragu
+supabase db push --dry-run
+```
+
+### Pull schema dari remote
+
+Kalau project remote sudah ada schema, sync ke lokal dulu sebelum bikin migrasi baru:
+
+```bash
+supabase db pull
+```
+
+Generate file migrasi yang isinya schema remote saat ini. Commit, dari sini development jalan via diff biasa.
+
+### Gotcha migrasi
+
+- **Jangan edit migrasi yang sudah pernah di-push.** Migrasi bersifat append-only. Kalau salah, bikin migrasi baru yang nge-fix.
+- **Timestamp di nama file harus monotonik.** CLI generate otomatis pakai UTC timestamp. Jangan rename manual.
+- **`db reset` di lokal jangan di production.** Beda command, tapi waspada saat copy-paste.
+- **Schema `auth` dan `storage` dikelola Supabase.** Jangan migrasi yang ubah tabel di schema itu kecuali tahu apa yang dilakukan.
+
+## Generate types
+
+Untuk TypeScript project (Next.js, Expo, dll), generate type definition dari schema biar client SDK type-safe:
+
+```bash
+supabase gen types --lang=typescript --local > database.types.ts
+```
+
+Untuk project yang sudah di-link:
+
+```bash
+supabase gen types --lang=typescript --linked > database.types.ts
+```
+
+Pakai di kode:
+
+```ts
+import { createClient } from '@supabase/supabase-js'
+import type { Database } from './database.types'
+
+const supabase = createClient<Database>(url, anonKey)
+
+// Auto-complete dan type check
+const { data } = await supabase
+  .from('notes')      // table name dari schema
+  .select('id, content, created_at')
+  .eq('user_id', userId)
+```
+
+Tambah ke `package.json` script:
+
+```json
+{
+  "scripts": {
+    "types": "supabase gen types --lang=typescript --local > database.types.ts"
+  }
+}
+```
+
+Jalankan `npm run types` tiap habis `db reset`.
+
+Lang lain yang didukung: `go`, `swift`, `python`.
+
+## Edge Function
+
+Edge Function pakai Deno runtime, di-deploy ke jaringan global Supabase. Lokal jalan via container `edge_runtime`.
+
+### Bikin function
+
+```bash
+supabase functions new hello-world
+```
+
+Hasilnya `supabase/functions/hello-world/index.ts`:
+
+```ts
+import "jsr:@supabase/functions-js/edge-runtime.d.ts"
+
+Deno.serve(async (req) => {
+  const { name } = await req.json()
+  return new Response(
+    JSON.stringify({ message: `Hello ${name}!` }),
+    { headers: { "Content-Type": "application/json" } }
+  )
+})
+```
+
+### Jalankan lokal
+
+```bash
+supabase functions serve
+```
+
+Hit lokal:
+
+```bash
+curl -i -X POST http://127.0.0.1:54321/functions/v1/hello-world \
+  -H "Authorization: Bearer <anon-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"world"}'
+```
+
+Anon key dari `supabase status`. Function lokal hot-reload otomatis tiap save file.
+
+### Deploy ke production
+
+```bash
+supabase functions deploy hello-world
+```
+
+Default deploy butuh JWT verification. Untuk webhook publik (mis. Stripe), disable:
+
+```bash
+supabase functions deploy stripe-webhook --no-verify-jwt
+```
+
+### Secrets
+
+Function biasa butuh secret (API key external, dll). Set via CLI:
+
+```bash
+supabase secrets set OPENAI_API_KEY=sk-...
+supabase secrets list
+```
+
+Akses di function:
+
+```ts
+const apiKey = Deno.env.get("OPENAI_API_KEY")
+```
+
+Untuk lokal, secret dibaca dari `supabase/functions/.env`:
+
+```bash
+echo "OPENAI_API_KEY=sk-local-test" > supabase/functions/.env
+supabase functions serve
+```
+
+### Function dengan database access
+
+Function dapat akses ke Postgres lokal pakai client biasa:
+
+```ts
+import { createClient } from "jsr:@supabase/supabase-js@2"
+
+Deno.serve(async (req) => {
+  const supabase = createClient(
+    Deno.env.get("SUPABASE_URL")!,
+    Deno.env.get("SUPABASE_SERVICE_ROLE_KEY")!
+  )
+  
+  const { data, error } = await supabase
+    .from("notes")
+    .select("*")
+    .limit(10)
+  
+  return new Response(JSON.stringify({ data, error }))
+})
+```
+
+`SUPABASE_URL` dan `SUPABASE_SERVICE_ROLE_KEY` auto-inject ke env function (lokal dan production).
+
+### Gotcha edge function
+
+- **Deno, bukan Node.** Tidak ada `require`, tidak ada `npm install`. Import via URL atau JSR (`jsr:@supabase/...`).
+- **Cold start ~50-100ms.** Function global, dingin saat pertama dipanggil dari region tertentu. Untuk endpoint yang sensitive latency, pertimbangkan rate yang konsisten.
+- **Body request stream sekali.** Kalau `await req.json()` dipanggil dua kali, error.
+- **Tidak ada filesystem persisten.** Function ephemeral. Untuk state, pakai Postgres atau Storage.
+
+## Daily routine
+
+```bash
+# Pagi, mulai stack
+supabase start
+
+# Selama development, ada perubahan schema
+supabase db diff -f <descriptive_name>
+# review file SQL, edit kalau perlu
+supabase db reset    # test apply ulang
+npm run types        # regenerate types
+
+# Ada perubahan function
+supabase functions serve    # foreground, hot-reload
+
+# Selesai hari, optional stop untuk hemat RAM
+supabase stop
+```
+
+Sebelum merge ke main:
+
+```bash
+supabase db push --dry-run    # cek migrasi yang akan apply
+supabase db push              # apply
+supabase functions deploy <name>    # deploy function
+```
+
+CI/CD bisa wrap ini, lihat [CI/CD setup](/id/supabase/tools/workflow#cicd) (placeholder, akan ditulis di section dedicated).
+
+## Setelah ini
+
+- Mulai bikin journey konkret: [Use-Case Journey S1: Auth + CRUD dengan RLS](/id/supabase/journeys) (work in progress)
+- Deep page per service: [Service Reference](/id/supabase/services) (work in progress)

@@ -1,33 +1,126 @@
-# Tools & Local Dev - Supabase
+# Tools & Local Dev
 
-> **Skeleton.** Halaman ini akan diisi setup local dev, CLI workflow, migration, branching, dan tooling pendamping.
+Stack Supabase tight ke Postgres dan tooling-nya kelar dengan satu perintah: `supabase start`. Bedanya sama AWS, kamu tidak adu konfigurasi 5 service di awal. Install CLI, `init`, `start`, dapat semua: Postgres, Auth, Storage, Realtime, Edge Function, Studio.
 
-## Outline target
+Halaman ini tiga bagian:
 
-### Supabase CLI
+- [Install CLI](#install-cli) dan `supabase init`
+- [Local Stack](/id/supabase/tools/local-stack): port, kredensial, service di balik `supabase start`, cara matiin yang tidak dipakai
+- [Workflow](/id/supabase/tools/workflow): migrasi, generate types, deploy edge function
 
-- Install per OS (Windows / Mac / Linux)
-- `supabase init` - bootstrap project
-- `supabase start` - jalankan full stack lokal (Postgres + GoTrue + Storage + Realtime + Edge Runtime + Studio)
-- `supabase status` - endpoint dan kredensial lokal
-- `supabase db reset` - apply ulang migrasi dari awal
+## Install CLI
 
-### Migration workflow
+Pilih satu, sesuai OS. Versi minimum: 2.0 (untuk Postgres 17 + Deno 2 runtime).
 
-- `supabase migration new <name>` - bikin file migrasi SQL
-- `supabase db push` - apply ke remote
-- `supabase db diff` - auto-generate migrasi dari perubahan schema lokal
+### macOS
 
-### Branching (Pro plan)
+```bash
+brew install supabase/tap/supabase
+```
 
-- Database branch per Git branch - preview environment per PR
-- Auto-merge migrasi saat PR di-merge
+### Windows
 
-### Tooling pendamping
+Scoop paling enak (binary native, auto-update):
 
-- `pg_dump` / `pg_restore` untuk backup
-- `postgrest` - REST API auto-generated dari schema
-- `pgmq` - message queue dalam Postgres
-- VS Code extension: Supabase + PostgreSQL
+```powershell
+scoop bucket add supabase https://github.com/supabase/scoop-bucket.git
+scoop install supabase
+```
 
-Detail dan resep copy-paste akan ditambahkan saat journey ditulis.
+Alternatif: download binary dari [releases](https://github.com/supabase/cli/releases), simpan di PATH.
+
+### Linux
+
+```bash
+brew install supabase/tap/supabase
+```
+
+Tanpa Homebrew, ambil binary dari GitHub releases lalu chmod +x.
+
+### Cross-platform (tanpa install)
+
+```bash
+npx supabase <command>
+```
+
+Pakai ini kalau cuma sesekali ngetes. Lambat di cold start karena npx fetch tiap kali.
+
+### Verifikasi
+
+```bash
+supabase --version
+# 2.x.x
+
+docker info
+# pastikan Docker daemon hidup, semua stack jalan via Docker
+```
+
+Docker Desktop atau Colima atau Rancher Desktop, bebas. Yang penting `docker` di PATH dan daemon hidup.
+
+## Bootstrap project
+
+```bash
+mkdir my-app
+cd my-app
+supabase init
+```
+
+Hasilnya satu folder `supabase/` dengan:
+
+```
+supabase/
+  config.toml          # konfigurasi stack lokal (port, fitur, auth)
+  seed.sql             # SQL yang jalan tiap kali db reset
+  migrations/          # file migrasi kosong, akan kamu isi nanti
+  functions/           # edge function (kosong)
+  .gitignore
+```
+
+`config.toml` adalah single source of truth. Mau ubah port, jwt expiry, fitur auth, semua di sini. Detail tweak ada di [Local Stack](/id/supabase/tools/local-stack#configuration).
+
+## Quickstart
+
+Tiga command, project hidup:
+
+```bash
+supabase init      # sekali, di awal
+supabase start     # 30-60 detik first run (pull image), 5 detik berikutnya
+supabase status    # lihat URL + kredensial lokal
+```
+
+Output `supabase status` kira-kira:
+
+```
+API URL:        http://127.0.0.1:54321
+GraphQL URL:    http://127.0.0.1:54321/graphql/v1
+DB URL:         postgresql://postgres:postgres@127.0.0.1:54322/postgres
+Studio URL:     http://127.0.0.1:54323
+Inbucket URL:   http://127.0.0.1:54324
+JWT secret:     super-secret-jwt-token-with-at-least-32-characters-long
+anon key:       eyJ...
+service_role key: eyJ...
+```
+
+Studio jalan di port 54323, mirror dashboard production. Login pakai Studio buat lihat schema, jalankan SQL, baca auth user, test storage bucket.
+
+Stop stack kalau sudah selesai:
+
+```bash
+supabase stop
+```
+
+Default ini cuma stop container, data Postgres tetap di volume. Untuk reset penuh:
+
+```bash
+supabase stop --no-backup    # buang volume juga
+```
+
+## Setelah ini
+
+- Detail port, env, dan cara matiin service yang tidak dipakai: [Local Stack](/id/supabase/tools/local-stack)
+- Workflow harian (migrasi, generate types, deploy function): [Workflow](/id/supabase/tools/workflow)
+- Mulai bikin fitur konkret: [Use-Case Journey](/id/supabase/journeys) (work in progress)
+
+## Catatan
+
+Supabase CLI versi 2.x butuh Docker. Kalau kamu di environment tanpa Docker (mis. corporate laptop locked down), ada flag eksperimental `--sandbox` di `supabase start` yang pakai native binary, tapi belum semua service didukung. Untuk dev serius, sediakan Docker.

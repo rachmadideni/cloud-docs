@@ -1,0 +1,232 @@
+# Local Stack
+
+`supabase start` jalanin 12 container Docker yang mirror production. Halaman ini bedah satu-satu: port, fungsi, kapan dimatikan untuk hemat resource.
+
+## Port map
+
+| Service | Port | URL | Fungsi |
+|---|---|---|---|
+| Kong (API gateway) | 54321 | http://127.0.0.1:54321 | Entry point semua API call. Routing ke gotrue, postgrest, storage, realtime, edge function. |
+| Postgres | 54322 | postgresql://postgres:postgres@127.0.0.1:54322/postgres | Database utama, Postgres 17. Connect pakai client SQL apa pun. |
+| Studio | 54323 | http://127.0.0.1:54323 | Dashboard web. Schema explorer, SQL editor, auth user list, storage browser. |
+| Inbucket | 54324 | http://127.0.0.1:54324 | Fake SMTP. Email signup, magic link, reset password masuk ke sini, tidak ke email beneran. |
+| Analytics | 54327 | http://127.0.0.1:54327 | Logflare backend untuk log container. Jarang dibuka langsung. |
+| Pooler (Supavisor) | 54329 | postgresql://postgres:postgres@127.0.0.1:54329/postgres | Connection pooler. Disabled default lokal, aktifkan kalau ngetes pooling. |
+
+Default kredensial Postgres lokal: user `postgres`, password `postgres`. Untuk hit API pakai `anon key` atau `service_role key` dari `supabase status`.
+
+## Service di balik Kong
+
+Kong di port 54321 routing ke service-service internal. Kamu cuma berinteraksi via Kong, tapi tahu siapa di belakang berguna kalau debug.
+
+| Path | Service | Container |
+|---|---|---|
+| `/auth/v1/*` | GoTrue (auth) | `supabase_auth_*` |
+| `/rest/v1/*` | PostgREST (REST API dari schema) | `supabase_rest_*` |
+| `/realtime/v1/*` | Realtime (CDC + broadcast + presence) | `supabase_realtime_*` |
+| `/storage/v1/*` | Storage API | `supabase_storage_*` |
+| `/functions/v1/*` | Edge Runtime (Deno) | `supabase_edge_runtime_*` |
+| `/graphql/v1` | pg_graphql (Postgres extension) | inside Postgres |
+
+Service support yang tidak di-expose lewat Kong:
+
+- `imgproxy`: resize image dari Storage, auto on-demand
+- `postgres-meta`: API metadata Postgres untuk Studio
+- `mailpit`: alt SMTP yang lebih modern dari Inbucket
+- `vector`: log collector untuk analytics
+
+## Container check
+
+Lihat semua container yang dipompa `supabase start`:
+
+```bash
+docker ps --filter "name=supabase_"
+```
+
+Stop satu container tanpa stop seluruh stack:
+
+```bash
+docker stop supabase_realtime_my-app
+```
+
+Restart Postgres saja (kalau hang setelah migrasi rusak):
+
+```bash
+docker restart supabase_db_my-app
+```
+
+## Configuration
+
+`supabase/config.toml` adalah satu-satunya tempat ubah perilaku stack lokal. Edit, lalu `supabase stop && supabase start` untuk apply.
+
+### Matiin service yang tidak dipakai
+
+Stack penuh makan RAM 1.5-2 GB. Kalau cuma butuh DB + Auth + Studio, matikan sisanya:
+
+```toml
+[realtime]
+enabled = false
+
+[storage]
+enabled = false
+
+[edge_runtime]
+enabled = false
+
+[analytics]
+enabled = false
+
+[inbucket]
+enabled = false
+```
+
+Atau lewat flag tanpa edit file:
+
+```bash
+supabase start --exclude realtime,storage-api,edge-runtime,logflare,vector
+```
+
+### Ubah port (kalau bentrok)
+
+Default Supabase pakai range 54321-54329. Bentrok kalau ada service lain di range itu. Ubah di `config.toml`:
+
+```toml
+[api]
+port = 8000
+
+[db]
+port = 8001
+
+[studio]
+port = 8002
+```
+
+### JWT expiry untuk testing
+
+Default JWT lokal hidup 1 jam. Untuk test refresh flow, perpendek:
+
+```toml
+[auth]
+jwt_expiry = 60   # detik, jadi 1 menit
+```
+
+### Disable email confirmation (lokal saja)
+
+Biar signup tidak perlu klik link di Inbucket setiap kali:
+
+```toml
+[auth.email]
+enable_confirmations = false
+```
+
+Jangan lupa kembali ke `true` saat tes flow production-like.
+
+## Environment variable
+
+Kalau aplikasi kamu (Next.js, Expo, dll) connect ke Supabase, ambil dari `supabase status` lalu set di `.env.local`:
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_ANON_KEY=eyJ...
+SUPABASE_SERVICE_ROLE_KEY=eyJ...
+```
+
+Anon key aman di-bundle ke frontend (RLS yang protect data). Service role key NEVER ke frontend, cuma di server / edge function / backend job.
+
+## Connection limit
+
+Postgres 17 lokal default `max_connections = 100`. Test app yang spawn banyak connection bakal hit limit. Tweak di `config.toml` (butuh restart):
+
+```toml
+[db]
+# tidak ada field max_connections langsung,
+# untuk tweak Postgres parameter, pakai migrasi SQL:
+```
+
+```sql
+-- supabase/migrations/00000_increase_connections.sql
+ALTER SYSTEM SET max_connections = 200;
+```
+
+Atau enable pooler:
+
+```toml
+[db.pooler]
+enabled = true
+pool_mode = "transaction"
+default_pool_size = 20
+max_client_conn = 100
+```
+
+Pooler aktif di port 54329. App kamu connect ke port itu, dapat connection multiplexed.
+
+## Data persistence
+
+Default `supabase start` simpan data Postgres di Docker volume bernama `supabase_db_<project-id>`. Restart container, data tetap. Pindah laptop, data ikut volume.
+
+Backup volume:
+
+```bash
+docker run --rm -v supabase_db_my-app:/data -v $(pwd):/backup alpine \
+  tar czf /backup/db-backup.tar.gz /data
+```
+
+Restore:
+
+```bash
+docker run --rm -v supabase_db_my-app:/data -v $(pwd):/backup alpine \
+  tar xzf /backup/db-backup.tar.gz -C /
+```
+
+Untuk reset penuh (drop volume):
+
+```bash
+supabase stop --no-backup
+```
+
+## Resource footprint
+
+Reality check di laptop biasa (M2 / 16GB RAM):
+
+- Cold start `supabase start`: 30-60 detik (pull image first time, 10-15 detik berikutnya)
+- RAM idle full stack: ~1.8 GB
+- RAM minimum stack (DB + Auth + Studio): ~600 MB
+- Disk image total: ~3 GB
+
+Kalau laptop berat, matiin realtime + storage + edge runtime saat dev journey yang tidak butuh.
+
+## Troubleshooting
+
+### `Error: Docker daemon is not running`
+
+Docker Desktop / Colima belum start. Buka aplikasinya. Di Linux, `sudo systemctl start docker`.
+
+### `port 54321 already allocated`
+
+Ada container/proses lain pakai port itu. Cek dengan `lsof -i :54321` (Mac/Linux) atau `netstat -ano | findstr 54321` (Windows). Kill, atau ubah port di `config.toml`.
+
+### `database "postgres" does not exist`
+
+Volume corrupt atau migrasi rusak. Reset:
+
+```bash
+supabase stop --no-backup
+supabase start
+```
+
+### `connection refused` dari app
+
+App connect terlalu cepat sebelum Postgres ready. `supabase start` exit setelah Kong hidup, tapi Postgres bisa masih warming up beberapa detik. Tambah retry di app, atau `supabase db reset` dulu sebelum jalankan app.
+
+### Studio tidak load schema
+
+Refresh hard (`Ctrl+Shift+R`). Kalau masih kosong, restart `postgres-meta`:
+
+```bash
+docker restart supabase_pg_meta_my-app
+```
+
+## Setelah ini
+
+- Migration workflow, generate types, deploy function: [Workflow](/id/supabase/tools/workflow)
+- Mulai bikin journey: [Use-Case Journey](/id/supabase/journeys)

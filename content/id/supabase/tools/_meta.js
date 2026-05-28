@@ -1,3 +1,5 @@
 export default {
-  index: 'Overview'
+  index: 'Overview',
+  'local-stack': 'Local Stack',
+  workflow: 'Workflow'
 }
