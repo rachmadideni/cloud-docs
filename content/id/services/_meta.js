@@ -23,5 +23,11 @@ export default {
   athena: 'Athena',
   cloudwatch: 'CloudWatch',
   xray: 'X-Ray',
-  opensearch: 'OpenSearch'
+  opensearch: 'OpenSearch',
+  kms: 'KMS',
+  secretsmanager: 'Secrets Manager',
+  cloudtrail: 'CloudTrail',
+  guardduty: 'GuardDuty',
+  bedrock: 'Bedrock',
+  sagemaker: 'SageMaker'
 }

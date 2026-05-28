@@ -1,0 +1,138 @@
+# CloudTrail
+
+**TL;DR**: Audit log semua API call di akun AWS. Siapa, kapan, action apa, ke resource mana. Wajib untuk forensic security incident dan compliance. Management event gratis, data event berbayar.
+
+## Analogi
+
+CCTV untuk akun AWS. Setiap action terekam: user X di region Y bikin EC2 di Z. Dengan trail aktif, kamu bisa replay kejadian saat audit atau breach investigation.
+
+## Kapan pakai
+
+- ✅ Compliance requirement (SOC 2, PCI-DSS, HIPAA, ISO 27001).
+- ✅ Security forensic post-incident.
+- ✅ Detect anomaly via CloudTrail Insights (ML-based).
+- ✅ Source data untuk GuardDuty threat detection.
+- ✅ Cross-account audit di Organizations.
+- ✅ Multi-region capture (default trail di-bikin).
+
+## Kapan jangan
+
+- ❌ Application log. Pakai CloudWatch Logs.
+- ❌ Real-time alerting per event. Trail eventual (5-15 menit delay). Pakai EventBridge rule yang trigger Lambda untuk near-real-time.
+- ❌ Data plane high-volume log (mis. S3 GetObject di traffic tinggi). Mahal. Selective enable.
+
+## Tipe event
+
+| Tipe | Cover | Cost |
+|---|---|---|
+| **Management event** | resource lifecycle (create, modify, delete) | gratis |
+| **Data event** | data access (S3 GetObject, Lambda Invoke, DynamoDB query) | $0.10/100k |
+| **Insights event** | ML-detected anomaly | $0.35/100k baseline |
+
+Management event by default capture semua. Data event opt-in per resource (karena volume bisa massive).
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| Trail 1 (management, multi-region) | gratis |
+| Trail 2+ | $2 per 100k event |
+| Data event | $0.10 per 100k |
+| Insights event | $0.35 per 100k baseline |
+| S3 storage trail | standard S3 rate |
+| CloudWatch Logs delivery | $0.50/GB ingestion |
+
+Akun normal: $0-5/bulan untuk audit baseline. Akun dengan S3 data event tinggi bisa $100-1000/bulan.
+
+## Local emulator
+
+**Floci status**: ⚠️ partial (trail bisa di-create, event delivery tidak 1:1)
+
+```bash
+# Bucket untuk trail log
+awsl s3 mb s3://my-cloudtrail-logs
+
+# Bucket policy allow CloudTrail write (singkat)
+awsl s3api put-bucket-policy --bucket my-cloudtrail-logs \
+  --policy file://trail-bucket-policy.json
+
+# Create trail
+awsl cloudtrail create-trail \
+  --name org-trail \
+  --s3-bucket-name my-cloudtrail-logs \
+  --is-multi-region-trail \
+  --enable-log-file-validation
+
+awsl cloudtrail start-logging --name org-trail
+```
+
+## Hello-world
+
+### Setup trail dengan log file validation
+
+```bash
+aws cloudtrail create-trail \
+  --name security-trail \
+  --s3-bucket-name org-cloudtrail-logs \
+  --is-multi-region-trail \
+  --include-global-service-events \
+  --enable-log-file-validation
+
+aws cloudtrail start-logging --name security-trail
+```
+
+`enable-log-file-validation` bikin digest file dengan hash log. Tahu kalau log file di-tamper.
+
+### Query CloudTrail Lake (SQL)
+
+CloudTrail Lake = managed query layer. SQL query log lewat AWS API.
+
+```sql
+SELECT
+  eventTime, userIdentity.userName, eventSource, eventName, sourceIPAddress
+FROM cloudtrail_lake_event_data
+WHERE eventTime > '2026-05-20T00:00:00Z'
+  AND eventName IN ('CreateUser', 'AttachUserPolicy', 'DeleteTrail')
+ORDER BY eventTime DESC
+```
+
+### EventBridge rule untuk near-real-time alert
+
+```json
+{
+  "source": ["aws.iam"],
+  "detail-type": ["AWS API Call via CloudTrail"],
+  "detail": {
+    "eventName": ["CreateAccessKey", "DeleteTrail"]
+  }
+}
+```
+
+Target Lambda yang post ke Slack saat IAM access key dibuat atau trail dihapus.
+
+## Gotcha
+
+- **Trail delete-able by attacker sebelum SCP attached**: attacker dengan akses admin bisa hapus trail untuk hide jejak. Lindungi dengan SCP plus S3 Object Lock di bucket trail.
+- **First trail gratis, sisanya $2/100k event**: hindari bikin trail duplikat per env. Pakai 1 trail organization-wide.
+- **Data event mahal di S3 high-traffic**: 100M GetObject = $100. Selective enable per bucket sensitive.
+- **Delay 5-15 menit log delivery**: bukan real-time. Untuk near-real-time, pakai EventBridge rule.
+- **Insights butuh 7 hari training data**: ML baseline learn pola normal dulu sebelum bisa detect anomaly.
+- **CloudTrail Lake pricing terpisah**: $2.50/GB ingestion + $0.005/GB scanned. Cocok untuk forensic, mahal untuk continuous query.
+- **Cross-region trail capture global service**: enable `--include-global-service-events` di salah satu trail untuk capture IAM, STS, CloudFront event yang region-less.
+- **S3 bucket policy untuk trail wajib spesifik**: AWS provide policy snippet. Salah policy = trail tidak bisa write.
+- **CloudWatch Logs delivery opsional dan extra cost**: by default trail cuma ke S3. Untuk query real-time, kirim juga ke CloudWatch (extra $0.50/GB).
+- **Encryption opt-in**: enable KMS encryption untuk trail log. Compliance baseline.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Activity Log | management event default |
+| Azure | Monitor Diagnostic Settings | data event per service |
+| GCP | Cloud Audit Logs | mirip, Admin + Data + System event |
+| Oracle | Audit | broader |
+
+## Belajar lebih lanjut
+
+- Pakai CloudTrail di journey: [J11 Security Baseline](/id/journeys/j11-security).
+- [AWS CloudTrail docs](https://docs.aws.amazon.com/cloudtrail/).
