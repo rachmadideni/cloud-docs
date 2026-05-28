@@ -11,6 +11,8 @@ export default {
   cognito: 'Cognito',
   ecs: 'ECS',
   ecr: 'ECR',
+  eks: 'EKS',
+  alb: 'ALB',
   sqs: 'SQS',
   sns: 'SNS',
   eventbridge: 'EventBridge',
@@ -18,5 +20,8 @@ export default {
   kinesis: 'Kinesis',
   firehose: 'Data Firehose',
   glue: 'Glue',
-  athena: 'Athena'
+  athena: 'Athena',
+  cloudwatch: 'CloudWatch',
+  xray: 'X-Ray',
+  opensearch: 'OpenSearch'
 }
