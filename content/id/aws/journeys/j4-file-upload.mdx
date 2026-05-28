@@ -348,7 +348,7 @@ awsl lambda create-function --function-name photos-moderate \
 
 Thumbnail Lambda butuh memory lebih besar (sharp pakai banyak RAM) dan timeout lebih panjang.
 
-### 9. Hubungkan S3 → Lambda thumbnail
+### 9. Hubungkan S3 -> Lambda thumbnail
 
 Tambah izin S3 untuk invoke Lambda:
 
@@ -380,7 +380,7 @@ awsl s3api put-bucket-notification-configuration \
 
 Filter `originals/` penting. Tanpa ini, thumbnail yang ditulis ke `thumbnails/` akan trigger Lambda lagi = infinite loop.
 
-### 10. Hubungkan SQS → Lambda moderate
+### 10. Hubungkan SQS -> Lambda moderate
 
 ```bash
 awsl lambda create-event-source-mapping \

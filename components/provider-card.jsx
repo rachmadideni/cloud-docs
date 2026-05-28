@@ -2,7 +2,7 @@ import Link from 'next/link'
 
 const statusStyle = {
   Active: { bg: '#dcfce7', fg: '#166534', dark: { bg: '#14532d', fg: '#bbf7d0' } },
-  Beta: { bg: '#fef3c7', fg: '#92400e', dark: { bg: '#78350f', fg: '#fde68a' } },
+  'On Progress': { bg: '#fef3c7', fg: '#92400e', dark: { bg: '#78350f', fg: '#fde68a' } },
   Soon: { bg: '#e0e7ff', fg: '#3730a3', dark: { bg: '#312e81', fg: '#c7d2fe' } }
 }
 

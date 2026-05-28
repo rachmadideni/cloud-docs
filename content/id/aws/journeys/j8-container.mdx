@@ -450,7 +450,7 @@ Vs Lambda + API Gateway untuk traffic equivalent (100k request/bulan): bisa di b
 
 Optimisasi:
 - **Fargate Spot**: 70% diskon, cocok worker job.
-- **Graviton (ARM)**: $0.04048 → $0.03238 (20% lebih murah). Image harus multi-arch atau pure ARM.
+- **Graviton (ARM)**: $0.04048 -> $0.03238 (20% lebih murah). Image harus multi-arch atau pure ARM.
 - **Right-size**: monitor CloudWatch task metric, kurangi CPU/memory kalau utilization rendah.
 - **Hibernate strategy**: ECS scheduled task untuk service dev (running cuma jam kantor).
 

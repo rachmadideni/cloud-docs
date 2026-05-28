@@ -8,7 +8,7 @@ Diagram flowchart yang beneran jalan. Setiap kotak adalah state (panggil Lambda,
 
 ## Kapan pakai
 
-- ✅ Multi-step workflow yang butuh persist state (mis. order fulfillment: validate → charge → ship → notify).
+- ✅ Multi-step workflow yang butuh persist state (mis. order fulfillment: validate -> charge -> ship -> notify).
 - ✅ Workflow lebih dari 15 menit (Lambda limit). Standard support sampai 1 tahun.
 - ✅ Need retry declarative dengan exponential backoff per step.
 - ✅ Parallel branch (panggil 5 API bersamaan, tunggu semua selesai).

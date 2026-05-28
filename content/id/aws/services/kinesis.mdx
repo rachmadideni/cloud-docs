@@ -113,7 +113,7 @@ Lambda terima batch record otomatis, checkpoint progress otomatis.
 
 ## Gotcha
 
-- **Partition key menentukan shard**: key yang sama → shard yang sama → ordered. Key yang skewed → hot shard → bottleneck.
+- **Partition key menentukan shard**: key yang sama -> shard yang sama -> ordered. Key yang skewed -> hot shard -> bottleneck.
 - **Hot shard limit**: 1 shard cuma 1000 record/s write. Traffic > limit kena `ProvisionedThroughputExceededException`. Pakai random partition key untuk distribute, atau tambah shard.
 - **Resharding lambat**: scale up shard via `update-shard-count` bisa puluhan detik. Plan capacity di muka untuk traffic spike yang sudah terprediksi.
 - **At-least-once delivery**: consumer bisa baca record sama dua kali. Harus idempotent.

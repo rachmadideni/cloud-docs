@@ -7,10 +7,10 @@ Waktu estimasi: 40 menit.
 ## Apa yang kita bangun
 
 Tambah observability ke API Notes dari [J2](/id/aws/journeys/j2-rest-api). Setelah selesai, kamu bisa jawab:
-- "Endpoint mana paling sering dipanggil?" → CloudWatch Metrics.
-- "Request yang error tadi, error apa di line berapa?" → CloudWatch Logs query.
-- "Request ini lambat 5 detik, di Lambda atau DynamoDB?" → X-Ray trace map.
-- "User mana paling sering hit error?" → OpenSearch log analytics.
+- "Endpoint mana paling sering dipanggil?" -> CloudWatch Metrics.
+- "Request yang error tadi, error apa di line berapa?" -> CloudWatch Logs query.
+- "Request ini lambat 5 detik, di Lambda atau DynamoDB?" -> X-Ray trace map.
+- "User mana paling sering hit error?" -> OpenSearch log analytics.
 
 ## Tiga pillar observability
 
@@ -186,7 +186,7 @@ async function processRequest(event, parentSpan) {
 Pattern penting:
 - **Structured log**: JSON dengan field konsisten (`requestId`, `method`, `path`). Mudah di-query.
 - **Correlation ID**: `requestId` muncul di tiap log line. Trace semua log untuk satu request.
-- **Trace span hierarchy**: parent (handler) → child (processRequest) → grandchild (dynamodb.query). Visualisasi waterfall di Jaeger.
+- **Trace span hierarchy**: parent (handler) -> child (processRequest) -> grandchild (dynamodb.query). Visualisasi waterfall di Jaeger.
 - **Span attributes**: tag dengan semantic convention OTel. Standard untuk cross-tool compatibility.
 
 ### 3. Deploy Lambda
@@ -244,7 +244,7 @@ awsl logs start-query \
 
 **Traces di Jaeger**:
 
-Buka `http://localhost:16686`. Pilih service `notes-api`, klik Find Traces. Tiap trace shows waterfall: handler → processRequest → dynamodb.query, dengan durasi tiap span.
+Buka `http://localhost:16686`. Pilih service `notes-api`, klik Find Traces. Tiap trace shows waterfall: handler -> processRequest -> dynamodb.query, dengan durasi tiap span.
 
 **Metrics di CloudWatch**:
 

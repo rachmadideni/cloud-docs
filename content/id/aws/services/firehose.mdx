@@ -110,7 +110,7 @@ Glue catalog harus punya schema yang sesuai. File output di S3 sebagai Parquet, 
 - **No retry built-in untuk Direct PUT**: Direct PUT cuma 1 attempt. Producer harus retry sendiri kalau API call fail.
 - **Error output prefix wajib**: kalau record gagal convert, masuk `ErrorOutputPrefix/`. Setup biar tidak lost.
 - **Lambda data transformation optional**: bisa attach Lambda yang transform record sebelum delivery. Lambda invocation cost ekstra. Lebih simpel pakai Glue ETL kalau transformation kompleks.
-- **Subscription filter dari CloudWatch Logs**: Firehose bisa langsung consume CloudWatch Log group, deliver ke S3. Pattern umum: log Lambda → CloudWatch → Firehose → S3 → Athena.
+- **Subscription filter dari CloudWatch Logs**: Firehose bisa langsung consume CloudWatch Log group, deliver ke S3. Pattern umum: log Lambda -> CloudWatch -> Firehose -> S3 -> Athena.
 - **Compression vs Parquet**: pakai salah satu. Parquet sudah built-in compression (Snappy). Jangan tambah gzip di atasnya.
 - **VPC delivery butuh ENI**: deliver ke OpenSearch atau Redshift di VPC butuh Firehose buat ENI di subnet. Cost ENI plus setup security group.
 

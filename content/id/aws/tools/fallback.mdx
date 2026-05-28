@@ -17,7 +17,7 @@ Service AWS yang **tidak** di-cover Floci, plus alternatif lokal dengan compose 
 | WAF, Shield | ❌ | konseptual | WAF + Shield Standard built-in di CloudFront/ALB |
 | SES delivery aktual | ⚠️ | Mailpit / MailHog | SES asli |
 
-## CloudFront → nginx reverse proxy
+## CloudFront -> nginx reverse proxy
 
 CloudFront utama untuk: CDN cache + HTTPS termination + path/host routing. nginx cover semua di lokal.
 
@@ -70,7 +70,7 @@ Edit `/etc/hosts` (Linux/Mac) atau `C:\Windows\System32\drivers\etc\hosts`:
 
 Pattern lengkap di [J1 Static Site](/id/aws/journeys/j1-static-site).
 
-## X-Ray → Jaeger + OpenTelemetry
+## X-Ray -> Jaeger + OpenTelemetry
 
 X-Ray AWS = distributed tracing. Jaeger open source = sama konsep, lebih portable. OpenTelemetry SDK adalah vendor-neutral instrumentation.
 
@@ -103,7 +103,7 @@ new NodeSDK({
 
 Saat deploy AWS, ganti exporter ke X-Ray atau pakai AWS Distro for OpenTelemetry (ADOT) Lambda layer. Code tidak perlu rewrite. Pattern di [J10 Observability](/id/aws/journeys/j10-observability).
 
-## Rekognition → stub manual atau sharp
+## Rekognition -> stub manual atau sharp
 
 Rekognition cover: image moderation, label detection, OCR, face match. Alternatif lokal:
 
@@ -156,7 +156,7 @@ const thumbnail = await sharp(input)
   .toBuffer()
 ```
 
-## Bedrock LLM → Ollama
+## Bedrock LLM -> Ollama
 
 Ollama run LLM open source di laptop. API mirip OpenAI format. Swap antara Ollama dan Bedrock via env var.
 
@@ -224,7 +224,7 @@ services:
 
 Saat AWS asli, swap ke OpenSearch Serverless atau Aurora pgvector atau Bedrock Knowledge Bases.
 
-## GuardDuty / Inspector / Macie → konseptual
+## GuardDuty / Inspector / Macie -> konseptual
 
 Tiga service threat detection AWS tidak punya pengganti lokal yang setara. Untuk lokal:
 
@@ -251,7 +251,7 @@ docker run -p 5002:5002 mcr.microsoft.com/presidio-analyzer
 
 Untuk test logic moderation/detection di pipeline, pakai stub yang return finding palsu. Saat produksi, switch ke GuardDuty/Inspector/Macie via env var atau feature flag.
 
-## SES delivery → Mailpit
+## SES delivery -> Mailpit
 
 SES API ada di Floci, tapi email tidak benar-benar dikirim. Mailpit catch email yang aplikasi kirim, tampilkan di UI web.
 
@@ -285,7 +285,7 @@ await transporter.sendMail({
 
 Buka `http://localhost:8025` untuk lihat email yang dikirim.
 
-## SageMaker → Jupyter / Colab
+## SageMaker -> Jupyter / Colab
 
 Untuk eksperimen ML tanpa AWS asli:
 
@@ -306,7 +306,7 @@ services:
 
 Untuk training serius (multi-GPU, distributed), tidak ada alternatif lokal yang fit. Pakai SageMaker di AWS asli (atau provider GPU lain seperti Lambda Labs, RunPod).
 
-## WAF / Shield → konseptual
+## WAF / Shield -> konseptual
 
 WAF AWS = web application firewall layer 7. Tidak ada alternatif lokal yang real.
 

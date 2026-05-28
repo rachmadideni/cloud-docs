@@ -10,9 +10,9 @@ export default async function LangLayout({ children, params }) {
     <>
       <Head />
       <Layout
-        navbar={<Navbar logo={<b>Cloud Docs</b>} />}
+        navbar={<Navbar logo={<b>Pocket Guide</b>} />}
         pageMap={pageMap}
-        footer={<Footer>MIT © Cloud Docs.</Footer>}
+        footer={<Footer>MIT © Pocket Guide.</Footer>}
         i18n={[
           { locale: 'id', name: 'Bahasa Indonesia' },
           { locale: 'en', name: 'English' }

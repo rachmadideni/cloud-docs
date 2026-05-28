@@ -11,9 +11,9 @@ Pipeline order untuk e-commerce kecil. Flow:
 1. User POST order ke API.
 2. Lambda publish event `order.created` ke EventBridge.
 3. EventBridge routing event ke 3 target paralel:
-   - **SQS** queue → Lambda kirim email konfirmasi
-   - **SNS** topic → fanout ke 2 Lambda: fraud check + analytics log
-   - **Step Functions** → workflow multi-step: validate → charge → ship → update status
+   - **SQS** queue -> Lambda kirim email konfirmasi
+   - **SNS** topic -> fanout ke 2 Lambda: fraud check + analytics log
+   - **Step Functions** -> workflow multi-step: validate -> charge -> ship -> update status
 
 Hasil: satu request POST trigger 5+ Lambda yang masing-masing punya tanggung jawab tunggal.
 

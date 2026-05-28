@@ -155,7 +155,7 @@ curl -X POST "$ENDPOINT/docs/_search" -d '{
 - **Master node untuk produksi**: cluster tanpa dedicated master rentan split-brain di traffic tinggi. Dedicated master 3 node minimum.
 - **Hot/warm/cold storage**: data tua pindah ke node murah (warm) atau snapshot S3 (cold). Hemat cost storage tinggi.
 - **OpenSearch Dashboards default tanpa auth**: setup Cognito atau fine-grained access control sebelum expose.
-- **Ingestion pipeline lambat**: kalau Lambda subscribe CloudWatch Logs → write ke OpenSearch, throughput limited. Pakai Firehose ke OpenSearch destination untuk batch.
+- **Ingestion pipeline lambat**: kalau Lambda subscribe CloudWatch Logs -> write ke OpenSearch, throughput limited. Pakai Firehose ke OpenSearch destination untuk batch.
 
 ## Cross-provider
 

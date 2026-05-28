@@ -380,7 +380,7 @@ Response berisi jawaban plus `sources` (chunk yang dipakai sebagai context). Jaw
 
 Ganti 3 hal:
 
-1. **Aktifkan model di Bedrock console**: AWS require explicit opt-in per model. Buka Bedrock console → Model access → request access ke Claude, Llama, atau model lain. Otomatis approved dalam menit.
+1. **Aktifkan model di Bedrock console**: AWS require explicit opt-in per model. Buka Bedrock console -> Model access -> request access ke Claude, Llama, atau model lain. Otomatis approved dalam menit.
 2. **Set env `USE_BEDROCK=true`** dan tambah IAM permission:
    ```bash
    aws iam attach-role-policy --role-name lambda-role \
@@ -400,7 +400,7 @@ Tidak perlu kelola vector DB sendiri.
 aws s3 cp docs.txt s3://my-rag-corpus/
 
 # Bikin Knowledge Base via console (lebih gampang dari CLI):
-# Bedrock → Knowledge bases → Create
+# Bedrock -> Knowledge bases -> Create
 # - Data source: S3 bucket
 # - Embedding model: Amazon Titan Embed
 # - Vector store: OpenSearch Serverless (auto-created)
@@ -493,7 +493,7 @@ aws apigatewayv2 delete-api --api-id $API_ID
 - Mau agent yang panggil tool (Lambda, API)? Bedrock Agent atau LangChain dengan function calling.
 - Mau training model custom? SageMaker JumpStart (pre-trained template) atau SageMaker Training Jobs.
 - Mau image generation? Bedrock Stable Diffusion atau Titan Image Generator.
-- Mau audio transcribe + summarize? Transcribe (speech-to-text) → Bedrock (summarize).
+- Mau audio transcribe + summarize? Transcribe (speech-to-text) -> Bedrock (summarize).
 - Mau evaluate quality LLM response? RAGAS framework untuk RAG eval, atau LangSmith untuk tracing.
 - Mau privacy-grade isolation? SageMaker endpoint dengan model yang di-host private, atau Bedrock dengan VPC endpoint.
 

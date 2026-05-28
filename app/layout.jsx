@@ -14,7 +14,7 @@ const robotoMono = Roboto_Mono({
 })
 
 export const metadata = {
-  title: 'Cloud Docs'
+  title: 'Pocket Guide'
 }
 
 export default function RootLayout({ children }) {

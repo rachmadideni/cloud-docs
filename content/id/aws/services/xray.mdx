@@ -1,6 +1,6 @@
 # X-Ray
 
-**TL;DR**: Distributed tracing service AWS. Trace request flow lewat multiple service (API GW → Lambda → DynamoDB → SQS → Lambda lain). Service map visual, latency breakdown per segment. Sampling default 1 req/detik + 5% rest untuk hemat cost.
+**TL;DR**: Distributed tracing service AWS. Trace request flow lewat multiple service (API GW -> Lambda -> DynamoDB -> SQS -> Lambda lain). Service map visual, latency breakdown per segment. Sampling default 1 req/detik + 5% rest untuk hemat cost.
 
 ## Analogi
 
@@ -101,7 +101,7 @@ async function fetchFromDB() {
 
 ### Service map
 
-Buka X-Ray console → Service Map. Visualisasi node per service, edge per call. Click node untuk lihat metric per segment.
+Buka X-Ray console -> Service Map. Visualisasi node per service, edge per call. Click node untuk lihat metric per segment.
 
 ## Gotcha
 
