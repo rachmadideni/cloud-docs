@@ -14,11 +14,11 @@
 /_pagefind/*
   Cache-Control: public, max-age=3600
 
-*.jpg
+/*.jpg
   Cache-Control: public, max-age=86400
 
-*.png
+/*.png
   Cache-Control: public, max-age=86400
 
-*.svg
+/*.svg
   Cache-Control: public, max-age=86400
