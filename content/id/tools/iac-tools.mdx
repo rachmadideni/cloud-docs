@@ -1,0 +1,401 @@
+# Infrastructure as Code
+
+Manage AWS resource via code, bukan klik-klik di console. Versioned di git, repeatable, review-able. Empat tool utama: Terraform, CDK, SAM, Pulumi. Plus CloudFormation native AWS (jarang dipakai langsung).
+
+## Pilih tool
+
+| Tool | Bahasa | Strength | Kapan pakai |
+|---|---|---|---|
+| **Terraform** | HCL | multi-cloud, ekosistem terluas | most cases, terutama multi-provider |
+| **CDK** | TS/Python/Java/Go | abstract tinggi, code real | AWS-only, team familiar TypeScript |
+| **SAM** | YAML + CLI | serverless-focused, deploy cepat | Lambda + API Gateway saja |
+| **Pulumi** | TS/Python/Go/.NET | TypeScript-first, mirip CDK tapi multi-cloud | team strongly TypeScript |
+| **CloudFormation** | YAML/JSON | native AWS, no extra tooling | jarang langsung, biasanya backend CDK/SAM |
+
+Aturan praktis:
+- **Multi-cloud / vendor-agnostic**: Terraform.
+- **AWS-only, serverless heavy**: SAM atau CDK.
+- **Team TypeScript native**: CDK atau Pulumi.
+
+## Terraform
+
+### Install
+
+```bash
+# Windows
+winget install -e --id Hashicorp.Terraform
+
+# Mac
+brew install terraform
+
+# Linux
+# https://developer.hashicorp.com/terraform/install
+```
+
+### Provider config untuk AWS
+
+```hcl
+# main.tf
+terraform {
+  required_providers {
+    aws = {
+      source  = "hashicorp/aws"
+      version = "~> 5.0"
+    }
+  }
+}
+
+provider "aws" {
+  region = "ap-southeast-3"
+}
+```
+
+### Provider untuk Floci (lokal)
+
+```hcl
+provider "aws" {
+  region                      = "us-east-1"
+  access_key                  = "test"
+  secret_key                  = "test"
+  skip_credentials_validation = true
+  skip_metadata_api_check     = true
+  skip_requesting_account_id  = true
+
+  endpoints {
+    s3       = "http://localhost:4566"
+    dynamodb = "http://localhost:4566"
+    lambda   = "http://localhost:4566"
+    iam      = "http://localhost:4566"
+    sts      = "http://localhost:4566"
+    # tambah per service yang dipakai
+  }
+
+  s3_use_path_style = true
+}
+```
+
+### Hello-world
+
+```hcl
+# main.tf
+resource "aws_s3_bucket" "demo" {
+  bucket = "demo-${random_string.suffix.result}"
+}
+
+resource "random_string" "suffix" {
+  length  = 8
+  special = false
+  upper   = false
+}
+
+output "bucket_name" {
+  value = aws_s3_bucket.demo.id
+}
+```
+
+```bash
+terraform init
+terraform plan
+terraform apply
+terraform destroy
+```
+
+### State management (production)
+
+State default di `terraform.tfstate` lokal. Untuk team, simpan di S3 backend:
+
+```hcl
+terraform {
+  backend "s3" {
+    bucket         = "my-tf-state"
+    key            = "prod/terraform.tfstate"
+    region         = "ap-southeast-3"
+    dynamodb_table = "tf-state-lock"
+    encrypt        = true
+  }
+}
+```
+
+DynamoDB table untuk state lock (prevent concurrent apply).
+
+### Module pattern
+
+```hcl
+# modules/lambda-api/main.tf
+variable "name" { type = string }
+variable "handler" { type = string }
+
+resource "aws_lambda_function" "this" {
+  function_name = var.name
+  handler       = var.handler
+  runtime       = "nodejs20.x"
+  role          = aws_iam_role.lambda.arn
+  filename      = "${var.name}.zip"
+}
+```
+
+```hcl
+# main.tf
+module "notes_api" {
+  source  = "./modules/lambda-api"
+  name    = "notes-api"
+  handler = "index.handler"
+}
+```
+
+## AWS CDK
+
+### Install
+
+```bash
+npm install -g aws-cdk
+```
+
+### Bootstrap (sekali per akun per region)
+
+```bash
+cdk bootstrap aws://000000000000/us-east-1
+```
+
+CDK butuh S3 bucket + IAM role di akun untuk staging asset.
+
+### Init project
+
+```bash
+mkdir my-stack && cd my-stack
+cdk init app --language typescript
+```
+
+### Stack contoh
+
+```ts
+// lib/my-stack.ts
+import * as cdk from 'aws-cdk-lib'
+import * as lambda from 'aws-cdk-lib/aws-lambda'
+import * as apigw from 'aws-cdk-lib/aws-apigatewayv2'
+import * as integ from 'aws-cdk-lib/aws-apigatewayv2-integrations'
+import * as ddb from 'aws-cdk-lib/aws-dynamodb'
+
+export class MyStack extends cdk.Stack {
+  constructor(scope: cdk.App, id: string, props?: cdk.StackProps) {
+    super(scope, id, props)
+
+    const table = new ddb.Table(this, 'Notes', {
+      partitionKey: { name: 'id', type: ddb.AttributeType.STRING },
+      billingMode: ddb.BillingMode.PAY_PER_REQUEST
+    })
+
+    const fn = new lambda.Function(this, 'NotesFn', {
+      runtime: lambda.Runtime.NODEJS_20_X,
+      handler: 'index.handler',
+      code: lambda.Code.fromAsset('lambda'),
+      environment: { TABLE_NAME: table.tableName }
+    })
+
+    table.grantReadWriteData(fn)
+
+    const api = new apigw.HttpApi(this, 'NotesApi')
+    api.addRoutes({
+      path: '/notes/{proxy+}',
+      methods: [apigw.HttpMethod.ANY],
+      integration: new integ.HttpLambdaIntegration('LambdaInteg', fn)
+    })
+
+    new cdk.CfnOutput(this, 'ApiUrl', { value: api.url! })
+  }
+}
+```
+
+### Deploy
+
+```bash
+cdk synth       # generate CloudFormation template
+cdk diff        # preview changes
+cdk deploy      # deploy
+cdk destroy     # cleanup
+```
+
+### CDK + Floci
+
+CDK pakai CloudFormation di belakang. Floci CloudFormation support partial. Pakai `--endpoint-url` saat aws-cli wrapping CDK, atau pakai library `cdklocal`:
+
+```bash
+npm install -g aws-cdk-local
+cdklocal bootstrap
+cdklocal deploy
+```
+
+## SAM (Serverless Application Model)
+
+### Install
+
+```bash
+# Windows
+winget install Amazon.AWSSAMCLI
+
+# Mac
+brew install aws-sam-cli
+```
+
+### Init project
+
+```bash
+sam init
+# pilih template (Hello World, Quick Start patterns)
+```
+
+### template.yaml
+
+```yaml
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+
+Resources:
+  NotesApi:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: ./
+      Handler: index.handler
+      Runtime: nodejs20.x
+      Events:
+        Api:
+          Type: HttpApi
+          Properties:
+            Path: /notes/{proxy+}
+            Method: ANY
+      Environment:
+        Variables:
+          TABLE_NAME: !Ref NotesTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref NotesTable
+
+  NotesTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      BillingMode: PAY_PER_REQUEST
+      AttributeDefinitions:
+        - AttributeName: id
+          AttributeType: S
+      KeySchema:
+        - AttributeName: id
+          KeyType: HASH
+
+Outputs:
+  ApiUrl:
+    Value: !Sub https://${ServerlessHttpApi}.execute-api.${AWS::Region}.amazonaws.com
+```
+
+### Local invoke (powerful untuk dev)
+
+```bash
+# Build
+sam build
+
+# Invoke Lambda lokal (tanpa AWS / Floci)
+sam local invoke NotesApi --event events/test-event.json
+
+# Start API Gateway lokal di port 3000
+sam local start-api
+
+# Curl ke localhost:3000
+curl http://localhost:3000/notes
+```
+
+### Deploy
+
+```bash
+sam deploy --guided   # pertama kali
+sam deploy            # subsequent
+```
+
+## Pulumi
+
+### Install
+
+```bash
+# Windows
+winget install Pulumi.Pulumi
+
+# Mac
+brew install pulumi
+```
+
+### Stack contoh (TypeScript)
+
+```ts
+// index.ts
+import * as aws from '@pulumi/aws'
+import * as awsx from '@pulumi/awsx'
+
+const bucket = new aws.s3.Bucket('demo')
+
+const table = new aws.dynamodb.Table('Notes', {
+  attributes: [{ name: 'id', type: 'S' }],
+  hashKey: 'id',
+  billingMode: 'PAY_PER_REQUEST'
+})
+
+const fn = new aws.lambda.CallbackFunction('notes', {
+  runtime: aws.lambda.Runtime.NodeJS20dX,
+  callback: async (event) => {
+    return { statusCode: 200, body: 'hello' }
+  }
+})
+
+export const bucketName = bucket.id
+export const tableName = table.name
+```
+
+### Deploy
+
+```bash
+pulumi stack init dev
+pulumi up
+pulumi destroy
+```
+
+State managed via Pulumi Cloud (free for individual) atau backend custom (S3, Azure Blob, dll).
+
+## Compare matrix detail
+
+| Aspek | Terraform | CDK | SAM | Pulumi |
+|---|---|---|---|---|
+| Multi-cloud | ✅ | ❌ AWS-only | ❌ AWS-only | ✅ |
+| Bahasa | HCL | TS/Py/Java/Go/.NET | YAML | TS/Py/Go/.NET |
+| Abstract level | rendah (sesuai resource AWS) | tinggi (Construct) | template Serverless | tinggi (real code) |
+| Local invoke | tidak (apply ke real) | tidak | iya (`sam local`) | tidak |
+| Drift detection | iya (refresh) | iya (drift) | tidak built-in | iya |
+| Community / module | terbesar | besar | medium | medium |
+| Learning curve | medium | tinggi (kalau gak familiar TS) | rendah | tinggi |
+| State management | wajib backend setup | CloudFormation native | CloudFormation native | Pulumi Cloud atau backend |
+
+## Best practice (semua tool)
+
+- **Plan/diff sebelum apply**: jangan langsung apply ke produksi.
+- **Separate env via workspace/stack**: `terraform workspace`, `cdk -c env=prod`, `pulumi stack`.
+- **State remote untuk team**: lokal state hilang = setup ulang.
+- **Resource tagging konsisten**: `Environment`, `Project`, `Owner`, `CostCenter`.
+- **No secret di code**: pakai Secrets Manager atau Parameter Store reference.
+- **Modul / Construct reusable**: 1 modul VPC, reuse di dev/staging/prod.
+- **Drift detection schedule**: weekly check, alert kalau manual change di console.
+- **CI/CD plan + apply**: PR review terraform plan output. Merge trigger apply.
+
+## Gotcha
+
+- **State conflict**: 2 orang apply bersamaan = state corrupt. Lock backend wajib.
+- **Resource yang di-import**: resource pre-existing harus di-import ke state sebelum manage. `terraform import` atau `cdk import`.
+- **Destroy danger**: `terraform destroy` hapus semua. Selalu plan dulu, dan jangan ada di state production yang penting.
+- **Provider version pinning**: tidak pin version = bisa break di update major. Pin di `required_providers`.
+- **Sensitive output**: variable berisi password / key terlihat di state file. Mark `sensitive = true`, encrypt state.
+- **Circular dependency**: VPC butuh subnet, subnet butuh VPC. Atur urutan dengan `depends_on` eksplisit.
+- **Region default vs explicit**: tool default region dari profile. Tapi resource bisa di region berbeda. Pastikan eksplisit.
+- **CDK bootstrap setiap region**: bootstrap di setiap region tempat deploy.
+
+## Belajar lebih lanjut
+
+- [Terraform docs](https://developer.hashicorp.com/terraform).
+- [AWS CDK docs](https://docs.aws.amazon.com/cdk/).
+- [AWS SAM docs](https://docs.aws.amazon.com/serverless-application-model/).
+- [Pulumi docs](https://www.pulumi.com/docs/).
+- Pakai IaC di workflow: [Dev Workflow](/id/tools/dev-workflow).

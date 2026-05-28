@@ -1,8 +1,28 @@
-# Floci — AWS Emulator Lokal
+# Floci, AWS Emulator Lokal
 
-[floci.io](https://floci.io) = single-binary emulator AWS, 45 service, MIT, gratis total. Default tool untuk semua journey di docs ini.
+[floci.io](https://floci.io) adalah single-binary emulator AWS dengan 45 service, MIT license, gratis total tanpa auth token. Drop-in replacement untuk LocalStack Community. Default tool untuk semua journey di docs ini.
 
-## Quick Start
+## Kenapa pakai Floci?
+
+- **Coverage lebih luas dari LocalStack Free**: Cognito, RDS Postgres/MySQL, ECS real Docker, EKS via k3s, ECR OCI registry, Athena via DuckDB. Yang di LocalStack butuh Pro berbayar, di Floci gratis.
+- **Single endpoint** `localhost:4566`. Tidak perlu setup port per service.
+- **Startup cepat**: ~24ms, idle memory ~13 MiB, image size ~90 MB.
+- **SDK compatibility 100%**: claim 1925/1925 SDK test pass. Code yang jalan di Floci 1:1 jalan di AWS asli.
+- **No auth token**: tidak perlu account, tidak perlu activate trial.
+
+## Install
+
+### Docker (recommended)
+
+```bash
+docker run --rm -p 4566:4566 \
+  -v /var/run/docker.sock:/var/run/docker.sock \
+  floci/floci:latest
+```
+
+Volume `/var/run/docker.sock` wajib untuk service yang spawn container (Lambda, ECS, EKS, ECR, CodeBuild).
+
+### Docker Compose (preferred untuk dev)
 
 ```yaml
 # docker-compose.yml
@@ -10,15 +30,286 @@ services:
   floci:
     image: floci/floci:latest
     ports: ['4566:4566']
-    volumes: ['/var/run/docker.sock:/var/run/docker.sock']
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+    environment:
+      - FLOCI_REGION=us-east-1
 ```
 
 ```bash
 docker compose up -d
 ```
 
-Endpoint: `http://localhost:4566`. Compatible dengan AWS SDK manapun — set `endpoint` ke localhost.
+### Windows
 
-## Service Coverage
+Install Docker Desktop terlebih dulu. Setelah Docker running, perintah `docker compose up` works identik.
 
-Lihat [Fallback Matrix](/id/tools/fallback) untuk gap service.
+PowerShell function untuk alias `awsl`:
+
+```powershell
+function awsl { aws --endpoint-url=http://localhost:4566 @args }
+```
+
+Simpan di `$PROFILE` untuk persist.
+
+### Mac (Apple Silicon)
+
+Floci image multi-arch (amd64 + arm64). Native Apple Silicon support.
+
+`/var/run/docker.sock` di Mac sebenarnya symlink ke socket di Docker Desktop. Works tanpa modification.
+
+### Linux
+
+Native fastest. Pastikan user di group `docker`:
+
+```bash
+sudo usermod -aG docker $USER
+# logout-login untuk apply
+```
+
+## Coverage matrix
+
+45 service total. Status: ✅ full | ⚠️ partial | ❌ gap.
+
+### Compute
+- ✅ **Lambda** (Docker-native execution, semua runtime)
+- ✅ **EC2** (real Docker container + IMDS)
+- ✅ **ECS** (real Docker container, Fargate launch type)
+- ✅ **EKS** (real k3s cluster)
+- ✅ **ECR** (OCI registry beneran)
+- ✅ **Auto Scaling**
+- ✅ **CodeBuild** (real Docker execution)
+- ✅ **CodeDeploy** (Lambda traffic shifting)
+- ✅ **AppConfig**
+
+### Storage & database
+- ✅ **S3** (semua fitur termasuk presigned, event, versioning)
+- ✅ **DynamoDB** (Streams, GSI, TTL)
+- ✅ **RDS** (Postgres, MySQL, MariaDB real)
+- ✅ **ElastiCache** (Redis real)
+- ✅ **AWS Backup**
+
+### API & networking
+- ✅ **API Gateway REST** (v1)
+- ✅ **API Gateway v2** (HTTP + WebSocket)
+- ✅ **ELB v2** (ALB + NLB)
+- ✅ **Route 53**
+- ✅ **ACM**
+- ❌ **CloudFront** (gap, pakai nginx fallback)
+
+### Identity & security
+- ✅ **IAM** (68+ operation)
+- ✅ **STS** (7 operation)
+- ✅ **Cognito** (JSON 1.1)
+- ✅ **KMS** (Sign + Verify + Encrypt + Decrypt)
+- ✅ **Secrets Manager**
+- ✅ **SSM Parameter Store**
+
+### Messaging & orchestration
+- ✅ **SQS** (Standard + FIFO)
+- ✅ **SNS** (Query + JSON)
+- ✅ **EventBridge** (Rules + Scheduler)
+- ✅ **Step Functions** (ASL support)
+
+### Streaming & analytics
+- ✅ **Kinesis** (JSON 1.1)
+- ✅ **Data Firehose**
+- ✅ **MSK** (via Redpanda)
+- ✅ **Athena** (DuckDB backend, query SQL beneran)
+- ✅ **Glue**
+- ✅ **OpenSearch**
+
+### Observability
+- ✅ **CloudWatch Logs**
+- ✅ **CloudWatch Metrics**
+- ✅ **CloudFormation**
+- ❌ **X-Ray** (gap, pakai Jaeger)
+
+### Email & document
+- ✅ **SES** (Query + JSON)
+- ✅ **Textract**
+
+### AI/ML
+- ⚠️ **Bedrock Runtime** (stub only, pakai Ollama)
+
+### Gap (perlu fallback)
+- ❌ CloudFront, X-Ray, Rekognition, GuardDuty, Inspector, Macie, SageMaker, WAF, Shield
+
+Lihat [Fallback Matrix](/id/tools/fallback) untuk solusi per gap.
+
+## Verifikasi setup
+
+```bash
+# Floci alive
+curl http://localhost:4566/_localstack/health
+
+# Test S3
+aws --endpoint-url=http://localhost:4566 s3 mb s3://test
+aws --endpoint-url=http://localhost:4566 s3 ls
+
+# Test Lambda
+aws --endpoint-url=http://localhost:4566 lambda list-functions
+```
+
+Output `{"Functions":[]}` artinya Floci responsive.
+
+## Troubleshooting
+
+### Port 4566 already in use
+
+```bash
+# Cek proses pakai port itu
+lsof -i :4566        # Mac/Linux
+netstat -ano | findstr 4566   # Windows PowerShell
+
+# Pakai port lain
+docker run -p 4567:4566 floci/floci:latest
+# Lalu set endpoint ke localhost:4567
+```
+
+### Docker socket permission denied (Linux)
+
+```bash
+sudo chmod 666 /var/run/docker.sock
+# Atau lebih aman: tambah user ke group docker
+sudo usermod -aG docker $USER
+```
+
+### Lambda tidak invoke (timeout atau crash)
+
+- Check Lambda log: `docker logs <floci-container-id>`.
+- Pastikan `/var/run/docker.sock` di-mount.
+- Image runtime (`nodejs20.x`) tersedia di Docker host. Floci pull dari registry kalau belum ada.
+- Memory cukup di Docker Desktop (default 2 GB, naikkan ke 4-8 GB).
+
+### RDS instance tidak ready
+
+RDS spawn container Postgres beneran. Butuh ~10-30 detik. Pakai `wait`:
+
+```bash
+aws --endpoint-url=http://localhost:4566 rds wait db-instance-available \
+  --db-instance-identifier mydb
+```
+
+### `host.docker.internal` tidak resolve di Linux
+
+Mac dan Windows otomatis resolve. Linux butuh tambahan di compose:
+
+```yaml
+services:
+  myapp:
+    extra_hosts:
+      - 'host.docker.internal:host-gateway'
+```
+
+### Data hilang antar restart
+
+Default Floci ephemeral. Untuk persist:
+
+```yaml
+services:
+  floci:
+    image: floci/floci:latest
+    ports: ['4566:4566']
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+      - ./floci-data:/var/lib/floci   # persist ke folder lokal
+```
+
+### Slow startup di Windows / WSL
+
+Docker Desktop di Windows WSL2 punya overhead. Speed-up:
+- Allocate lebih banyak resource di Docker Desktop settings.
+- Pakai WSL2 backend, bukan Hyper-V.
+- Project file di filesystem Linux WSL (`\\wsl$\...`), bukan `/mnt/c/...`.
+
+## CI integration
+
+### GitHub Actions
+
+```yaml
+name: Integration test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      floci:
+        image: floci/floci:latest
+        ports: ['4566:4566']
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - name: Wait for Floci ready
+        run: |
+          for i in {1..30}; do
+            curl -sf http://localhost:4566/_localstack/health && break
+            sleep 1
+          done
+
+      - name: Install dependencies
+        run: npm ci
+
+      - name: Run integration tests
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: npm test
+```
+
+### GitLab CI
+
+```yaml
+test:
+  image: node:20
+  services:
+    - name: floci/floci:latest
+      alias: floci
+  variables:
+    AWS_ENDPOINT_URL: http://floci:4566
+    AWS_REGION: us-east-1
+    AWS_ACCESS_KEY_ID: test
+    AWS_SECRET_ACCESS_KEY: test
+  script:
+    - npm ci
+    - npm test
+```
+
+## Floci vs LocalStack vs alternatif lain
+
+| Aspek | Floci | LocalStack Community | LocalStack Pro | MinIO + standalone |
+|---|---|---|---|---|
+| Lisensi | MIT, gratis | Apache 2.0 gratis | berbayar ($35/user/bulan) | mixed |
+| Cognito | ✅ | ❌ | ✅ | tidak ada |
+| RDS Postgres real | ✅ | ❌ | ✅ | pakai container Postgres terpisah |
+| ECS real Docker | ✅ | ❌ | ✅ | tidak ada |
+| EKS real k3s | ✅ | ❌ | ✅ | pakai kind/k3s terpisah |
+| Athena beneran | ✅ DuckDB | ❌ | ✅ | tidak |
+| CloudFront | ❌ | ❌ | ✅ | nginx |
+| GuardDuty | ❌ | ❌ | ⚠️ basic | tidak ada |
+| Setup complexity | rendah | rendah | medium | tinggi |
+
+**Kapan pakai LocalStack Pro vs Floci**: kalau butuh CloudFront emulation beneran, GuardDuty, Inspector, atau enterprise support contract. Untuk 90% use case dev, Floci cukup dan gratis.
+
+## Catatan production
+
+Floci masih relatif baru. Walau coverage luas dan testing thorough, untuk workload kritis pertimbangkan:
+
+- Test di staging account AWS asli sebelum produksi.
+- Fallback ke LocalStack Pro kalau Floci stuck atau missing feature.
+- Report bug ke [github.com/floci/floci](https://github.com/floci/floci).
+
+## Belajar lebih lanjut
+
+- Setup compose lengkap multi-service: [Compose Recipes](/id/tools/compose-recipes).
+- Gap dan fallback: [Fallback Matrix](/id/tools/fallback).
+- Integrate ke pipeline: [CI/CD](/id/tools/cicd).
+- [floci.io](https://floci.io) official docs.

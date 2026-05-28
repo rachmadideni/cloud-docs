@@ -1,6 +1,33 @@
 # Tools & Emulator
 
-Setup local development environment untuk cloud service tanpa harus deploy ke cloud beneran.
+Setup local development environment plus tooling untuk kerja sehari-hari dengan cloud.
 
-- [Floci](/id/tools/floci) — AWS emulator default (45 service, gratis, MIT)
-- [Fallback Matrix](/id/tools/fallback) — service gap & alternatif lokal
+## Emulator
+
+- [Floci](/id/tools/floci), AWS emulator default (45 service, gratis, MIT)
+- [Fallback Matrix](/id/tools/fallback), service gap + alternatif lokal
+
+## CLI & SDK
+
+- [AWS CLI](/id/tools/aws-cli), install + configure profile + alias Floci
+
+## Infrastructure as Code
+
+- [IaC Tools](/id/tools/iac-tools), Terraform vs CDK vs SAM vs Pulumi
+
+## Setup recipes
+
+- [Compose Recipes](/id/tools/compose-recipes), docker-compose siap pakai per journey
+
+## Pipeline & operations
+
+- [CI/CD](/id/tools/cicd), GitHub Actions + GitLab CI dengan OIDC
+- [Dev Workflow](/id/tools/dev-workflow), daily pattern + useful CLI tool
+
+## Mulai dari mana?
+
+1. **Hari pertama**: install [AWS CLI](/id/tools/aws-cli) + Docker + clone repo.
+2. **Setup Floci**: ikuti [Floci](/id/tools/floci).
+3. **Pick journey**: pilih dari [Use-Case Journey](/id/journeys), pakai compose recipe yang sesuai.
+4. **Iterate**: pakai [Dev Workflow](/id/tools/dev-workflow) pattern.
+5. **Deploy**: setup [CI/CD](/id/tools/cicd) saat ready ke production.

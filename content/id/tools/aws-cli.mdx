@@ -1,0 +1,295 @@
+# AWS CLI
+
+CLI standar untuk akses semua service AWS. Dipakai di semua journey docs ini. Pre-requisite: install + configure profile, plus alias `awsl` untuk Floci.
+
+## Install
+
+### Windows
+
+```powershell
+# Pakai winget (recommended)
+winget install -e --id Amazon.AWSCLI
+
+# Atau MSI installer
+# https://awscli.amazonaws.com/AWSCLIV2.msi
+```
+
+Verifikasi:
+
+```powershell
+aws --version
+# aws-cli/2.x.x ...
+```
+
+### Mac
+
+```bash
+brew install awscli
+```
+
+### Linux
+
+```bash
+curl "https://awscli.amazonaws.com/awscli-exe-linux-x86_64.zip" -o awscliv2.zip
+unzip awscliv2.zip
+sudo ./aws/install
+```
+
+## Configure profile
+
+### Profile manual via `aws configure`
+
+```bash
+aws configure --profile dev
+# AWS Access Key ID: <key>
+# AWS Secret Access Key: <secret>
+# Default region: ap-southeast-3
+# Default output format: json
+```
+
+Hasilnya di `~/.aws/credentials` dan `~/.aws/config`:
+
+```ini
+# ~/.aws/credentials
+[dev]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+
+[prod]
+aws_access_key_id = AKIA...
+aws_secret_access_key = ...
+```
+
+```ini
+# ~/.aws/config
+[profile dev]
+region = ap-southeast-3
+output = json
+
+[profile prod]
+region = ap-southeast-3
+output = json
+role_arn = arn:aws:iam::123456789012:role/Admin
+source_profile = dev
+mfa_serial = arn:aws:iam::987654321098:mfa/alice
+```
+
+`role_arn` + `source_profile` = profile dev assume role di akun prod. Pattern cross-account.
+
+### Pilih profile per command
+
+```bash
+aws s3 ls --profile prod
+```
+
+Atau set env var:
+
+```bash
+export AWS_PROFILE=prod
+aws s3 ls  # otomatis pakai prod
+```
+
+PowerShell:
+
+```powershell
+$env:AWS_PROFILE = 'prod'
+aws s3 ls
+```
+
+### AWS SSO (recommended untuk team)
+
+Setup sekali:
+
+```bash
+aws configure sso
+# SSO start URL: https://your-org.awsapps.com/start
+# SSO region: ap-southeast-3
+# pilih akun + role
+# profile name: prod
+```
+
+Login berkala (token expire 8-12 jam):
+
+```bash
+aws sso login --profile prod
+```
+
+Tidak ada long-term access key di disk. Token temporary, lebih aman.
+
+## Alias untuk Floci
+
+### Bash / zsh (Mac/Linux)
+
+```bash
+# ~/.bashrc atau ~/.zshrc
+alias awsl='aws --endpoint-url=http://localhost:4566'
+alias awsd='aws --profile dev'
+alias awsp='aws --profile prod'
+```
+
+### PowerShell (Windows)
+
+```powershell
+# $PROFILE
+function awsl { aws --endpoint-url=http://localhost:4566 @args }
+function awsd { aws --profile dev @args }
+function awsp { aws --profile prod @args }
+```
+
+Cek `$PROFILE` path: `echo $PROFILE`. Bikin file kalau belum ada.
+
+Reload shell setelah edit.
+
+## Useful command snippet
+
+### Audit IAM
+
+```bash
+# List user yang access key sudah lama
+aws iam list-users --query 'Users[*].[UserName,CreateDate]' --output table
+
+# Cek age access key
+aws iam list-access-keys --user-name alice \
+  --query 'AccessKeyMetadata[*].[AccessKeyId,Status,CreateDate]'
+
+# Cek MFA enabled
+aws iam list-virtual-mfa-devices \
+  --query 'VirtualMFADevices[*].[SerialNumber,User.UserName]'
+
+# User tanpa MFA
+aws iam list-users --query 'Users[*].UserName' --output text | \
+  while read u; do
+    mfa=$(aws iam list-mfa-devices --user-name $u --query 'MFADevices[*]' --output text)
+    [ -z "$mfa" ] && echo "$u no MFA"
+  done
+```
+
+### Audit resource
+
+```bash
+# EC2 running di semua region
+for region in $(aws ec2 describe-regions --query 'Regions[].RegionName' --output text); do
+  echo "=== $region ==="
+  aws ec2 describe-instances --region $region \
+    --query 'Reservations[*].Instances[?State.Name==`running`].[InstanceId,InstanceType]' \
+    --output table
+done
+
+# S3 bucket tanpa encryption
+aws s3api list-buckets --query 'Buckets[*].Name' --output text | \
+  while read b; do
+    aws s3api get-bucket-encryption --bucket $b 2>/dev/null || echo "$b NO encryption"
+  done
+
+# Lambda yang tidak invoke 30 hari terakhir
+aws lambda list-functions --query 'Functions[*].FunctionName' --output text | \
+  while read fn; do
+    last=$(aws lambda get-function --function-name $fn \
+      --query 'Configuration.LastModified' --output text)
+    echo "$fn $last"
+  done
+```
+
+### Cost & resource cleanup
+
+```bash
+# EBS volume unattached
+aws ec2 describe-volumes --filters Name=status,Values=available \
+  --query 'Volumes[*].[VolumeId,Size,CreateTime]' --output table
+
+# Elastic IP yang tidak attach (charged $0.005/jam)
+aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].PublicIp'
+
+# Snapshot lama
+aws ec2 describe-snapshots --owner-ids self \
+  --query 'Snapshots[?StartTime<`2025-01-01`].[SnapshotId,StartTime]'
+```
+
+### Logs
+
+```bash
+# Tail Lambda log
+aws logs tail /aws/lambda/my-fn --follow
+
+# Query Logs Insights
+QID=$(aws logs start-query \
+  --log-group-name /aws/lambda/my-fn \
+  --start-time $(date -d '1 hour ago' +%s) \
+  --end-time $(date +%s) \
+  --query-string 'fields @timestamp, level, message | filter level = "error"' \
+  --query queryId --output text)
+
+sleep 3
+aws logs get-query-results --query-id $QID
+```
+
+### SSM Session Manager (akses EC2 tanpa SSH)
+
+```bash
+# Install plugin sekali
+# Windows: winget install Amazon.SessionManagerPlugin
+# Mac: brew install --cask session-manager-plugin
+# Linux: download dari AWS docs
+
+aws ssm start-session --target i-0123456789abcdef0
+```
+
+Tidak butuh SSH key, tidak butuh public IP, tidak butuh open port. Authentication via IAM, audit via CloudTrail.
+
+### Port forwarding ke private RDS
+
+```bash
+aws ssm start-session \
+  --target i-bastion-instance \
+  --document-name AWS-StartPortForwardingSessionToRemoteHost \
+  --parameters '{"host":["rds-endpoint.region.rds.amazonaws.com"],"portNumber":["5432"],"localPortNumber":["5432"]}'
+
+# Sekarang localhost:5432 forward ke RDS via bastion
+psql -h localhost -U postgres
+```
+
+## Output formatting
+
+| Flag | Use case |
+|---|---|
+| `--output json` (default) | parse via jq |
+| `--output table` | human read |
+| `--output text` | shell script pipe |
+| `--output yaml` | config-friendly |
+| `--query '...'` | JMESPath filter |
+
+Contoh query JMESPath:
+
+```bash
+# Cuma kolom tertentu, satu instance
+aws ec2 describe-instances \
+  --query 'Reservations[0].Instances[0].{Id:InstanceId,Type:InstanceType,IP:PrivateIpAddress}'
+
+# Filter dengan kondisi
+aws ec2 describe-instances \
+  --query 'Reservations[*].Instances[?State.Name==`running`]|[*].[InstanceId,Tags[?Key==`Name`]|[0].Value]' \
+  --output table
+
+# Sort
+aws ec2 describe-snapshots --owner-ids self \
+  --query 'sort_by(Snapshots, &StartTime)[*].[SnapshotId,StartTime]'
+```
+
+## Gotcha
+
+- **Default region**: `aws configure` set default. Tapi `--region` flag override per command. Cek `aws configure get region`.
+- **Access key di env var menang dari profile**: `AWS_ACCESS_KEY_ID` di env override profile. Hati-hati saat switch profile, unset env var dulu.
+- **JSON output di Windows PowerShell**: parse pakai `ConvertFrom-Json` bukan `jq`.
+- **Long-running command timeout**: default CLI timeout 60 detik untuk single API call. Untuk operation lama (snapshot copy), pakai `wait` command.
+- **Pagination otomatis di CLI v2**: hasil > 1000 item auto-paginate. Untuk hentikan, `--max-items` atau `--page-size`.
+- **`--no-cli-pager` untuk script**: default CLI v2 pakai less. Di script CI, set `AWS_PAGER=""` atau `--no-cli-pager`.
+- **Profile name case-sensitive**: `dev` ≠ `Dev`. Konsisten lower-case.
+- **CLI v1 deprecated**: pakai v2 yang lebih cepat dan support SSO.
+- **Endpoint override per command vs global**: pakai `--endpoint-url` per command, atau set `AWS_ENDPOINT_URL` env var (CLI v2 baru support sejak 2024).
+- **`aws configure list` untuk debug**: lihat profile aktif, region, credential source.
+
+## Belajar lebih lanjut
+
+- [AWS CLI v2 docs](https://docs.aws.amazon.com/cli/).
+- [JMESPath tutorial](https://jmespath.org/tutorial.html) untuk query syntax.
+- Pakai di workflow daily: [Dev Workflow](/id/tools/dev-workflow).
