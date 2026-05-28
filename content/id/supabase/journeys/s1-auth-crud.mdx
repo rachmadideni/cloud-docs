@@ -154,6 +154,8 @@ NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon-key-dari-supabase-status>
 
 `SUPABASE_SERVICE_ROLE_KEY` JANGAN ditaruh di sini. Service role bypass RLS, dipakai cuma di server-only context (mis. admin script). Untuk journey ini kita tidak pakai.
 
+> **Catatan key:** `anon key` adalah nama legacy. Juli 2025 Supabase launch `publishable key` (format `sb_publishable_...`) sebagai pengganti, lebih aman karena bisa di-rotate. Lokal CLI masih emit anon key, jadi env var di atas pakai nama lama. Untuk project production baru, kamu mungkin lihat `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` di Dashboard. Fungsi identik dari sisi RLS. Detail di [Tools/Overview](/id/supabase/tools#catatan-nama-key-anon-vs-publishable).
+
 Generate types dari schema:
 
 ```bash

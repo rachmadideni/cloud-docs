@@ -103,6 +103,14 @@ service_role key: eyJ...
 
 Studio jalan di port 54323, mirror dashboard production. Login pakai Studio buat lihat schema, jalankan SQL, baca auth user, test storage bucket.
 
+### Catatan nama key: anon vs publishable
+
+`anon key` dan `service_role key` di output di atas adalah nama legacy (format JWT, hardcoded expire 10 tahun). Juli 2025 Supabase launch sistem baru: `publishable key` (ganti anon) dan `secret key` (ganti service_role), format `sb_publishable_...` dan `sb_secret_...`, bisa di-rotate instant dan revoke granular.
+
+Untuk lokal, CLI masih emit nama legacy. Untuk project production baru di Dashboard, kamu akan lihat publishable + secret sebagai default. Legacy key tetap jalan paralel sampai akhir 2026.
+
+Fungsi identik dari perspektif RLS dan role Postgres. Yang beda cuma format dan key management. Di journey docs ini kita pakai nama legacy biar match dengan output `supabase status`.
+
 Stop stack kalau sudah selesai:
 
 ```bash
