@@ -1,0 +1,177 @@
+# Glossary
+
+Istilah Supabase-specific dan padanannya di ekosistem cloud lain. Alfabetis. Jika istilah generik (REST, SQL, JWT) tidak dijelaskan ulang di sini, asumsikan definisi umum.
+
+## A
+
+**AAL (Authenticator Assurance Level)**: claim di JWT yang nunjukin tingkat verifikasi user. `aal1` = single factor (password atau OAuth). `aal2` = MFA selesai. Pakai di RLS untuk step-up auth (operasi sensitif butuh aal2).
+
+**Anon key**: nama legacy untuk API key low-privilege (replaced by **publishable key** July 2025). Format JWT, hard-coded expire 10 tahun, tidak bisa rotate. Aman di-bundle ke client karena RLS yang protect data.
+
+**Auth schema**: schema Postgres `auth` yang dikelola GoTrue. Berisi `auth.users` (user table), `auth.sessions` (session table), `auth.identities` (provider linking). Jangan edit langsung, pakai SDK auth method.
+
+**`auth.jwt()`**: function Postgres yang return current JWT claims sebagai jsonb. Pakai di RLS untuk akses custom claim: `(auth.jwt() ->> 'user_role') = 'admin'`.
+
+**`auth.uid()`**: function Postgres yang return UUID user yang sedang authenticated. Pakai di RLS untuk per-row authorization: `(select auth.uid()) = user_id`.
+
+## B
+
+**Branch project**: preview Postgres database per Git branch (Pro plan). Schema clone dari production, data isolated. Auto-create saat PR open, auto-delete saat PR close.
+
+**Broadcast**: salah satu tiga mode Realtime. Pub/sub ephemeral antar client tanpa simpan ke DB. Sender publish event, semua subscriber channel dapat. Cocok untuk: typing indicator, cursor position, reaction emoji.
+
+**Bucket**: container Storage. Public bucket = file accessible tanpa auth via URL. Private bucket = butuh signed URL atau JWT. Setting per bucket: size limit, allowed MIME, public flag.
+
+## C
+
+**CDC (Change Data Capture)**: pola tail Postgres replication slot untuk dapat event INSERT/UPDATE/DELETE. Supabase Realtime mode "Postgres Changes" pakai pola ini.
+
+**Channel**: konsep Realtime yang representasi topic subscription. Satu WebSocket connection bisa multiplex banyak channel. Channel name convention: `<resource>:<id>` (mis. `room:abc-123`).
+
+**Compute add-on**: upgrade RAM + CPU Postgres dari shared ke dedicated. Naik dari small ($25 included Pro) ke 4XL ($910/bulan). Affect query latency, index in-RAM, concurrent connection.
+
+**`config.toml`**: file konfigurasi local stack di `supabase/config.toml`. Source of truth untuk port, fitur, auth setting, bucket declaration. Restart stack untuk apply.
+
+**Cosine distance**: metrik similarity untuk vector embedding. Operator `<=>` di pgvector. Range [0, 2], 0 = identik. Untuk text embedding normalized (OpenAI, Cohere) ekuivalen ranking dengan inner product.
+
+**Cron job (Postgres)**: ekstensi `pg_cron` untuk schedule SQL job dalam Postgres. Mirip Linux cron tapi jalan di DB. Pakai untuk: cleanup, periodic aggregation, drain queue.
+
+## D
+
+**Deno**: JavaScript runtime yang dipakai Edge Function. Pengganti Node.js, support import via URL/JSR/npm:, Web Standard API native. Cold start lebih cepat dari Lambda Node.
+
+**Distance operator**: operator pgvector untuk hitung similarity vector. `<=>` cosine, `<->` Euclidean (L2), `<#>` negative inner product.
+
+**Drift (schema drift)**: kondisi schema production beda dari migrasi di Git. Sering muncul kalau team edit langsung via Studio production. Detect via `supabase db diff --linked`.
+
+## E
+
+**Edge Function**: serverless function di Deno runtime, deploy ke jaringan edge global Supabase. Mirip AWS Lambda dengan tight integration ke Auth + DB.
+
+**Edge Runtime**: container Deno yang host Edge Function. Jalan default di local stack lewat `supabase start`.
+
+**Egress**: bandwidth turun ke client. Counted di billing semua plan. Asset publik yang sering diakses bisa habis egress quota cepat.
+
+**Embedding**: representasi vector dari text/image hasil dari model embedding (OpenAI text-embedding-3-small, Voyage, dll). Disimpan di kolom `vector(N)` untuk similarity search.
+
+**ESM (ES Modules)**: standard JavaScript module dengan `import`/`export`. Edge Function (Deno) ESM-only, tidak support CommonJS `require()`.
+
+## F
+
+**FTS (Full-Text Search)**: pencarian text berbasis token, pakai `tsvector` dan `tsquery` di Postgres. Kombinasi dengan vector search = hybrid search.
+
+## G
+
+**GoTrue**: service auth Supabase, ditulis di Go. Handle signup, signin, password reset, OAuth, MFA. Endpoint di balik `/auth/v1`. Issued JWT yang RLS baca.
+
+## H
+
+**HNSW (Hierarchical Navigable Small World)**: tipe index pgvector untuk fast similarity search. Build slow, query super cepat, memory hungry. Akurasi recall di atas 95% default.
+
+**Hook (Auth Hook)**: function Postgres yang GoTrue panggil di lifecycle event. Empat hook: Custom Access Token (inject claim), Password Verification Attempt (audit), Send Email, Send SMS.
+
+**Hybrid search**: kombinasi vector similarity + full-text search. Pakai untuk: query yang campur semantic + keyword (mis. produk dengan brand name spesifik).
+
+## I
+
+**imgproxy**: container yang handle image transform on-demand di Storage. Resize, format conversion, quality adjustment via URL parameter. Bundled di Supabase.
+
+**Inbucket / Mailpit**: fake SMTP catcher untuk lokal dev. Email signup, magic link, reset password ditangkap di sini, tidak ke email beneran. Config key di `config.toml` masih `[inbucket]`, container actual = Mailpit. UI di port 54324.
+
+**Inner product**: distance metric untuk vector. Operator `<#>` di pgvector. Untuk vector normalized = ekuivalen ranking dengan cosine.
+
+**IVFFlat**: tipe index pgvector alternative ke HNSW. Build cepat, query lebih lambat, memory friendly. Butuh re-train kalau dataset banyak berubah.
+
+## J
+
+**JSR (JavaScript Registry)**: registry modern Deno-native pengganti deno.land/x. Import via `jsr:@scope/name`.
+
+**JWT (JSON Web Token)**: token autentikasi yang GoTrue issue setelah login. Claims include `sub` (user UUID), `aud` (audience), `aal`, `amr`, custom claim dari hook.
+
+**JWT signing keys**: sistem 2025 untuk asymmetric JWT signing (ES256). Pengganti HS256 lama. Public key bisa di-share aman, private cuma di GoTrue. Support rotation tanpa downtime.
+
+## K
+
+**Kong**: API gateway yang routing request ke service belakang (GoTrue, PostgREST, Storage, Realtime). Validate JWT di gateway level. Endpoint utama project di port 54321 (lokal) atau `<ref>.supabase.co`.
+
+## M
+
+**MAU (Monthly Active User)**: user yang login setidaknya sekali per periode tagihan. Bukan total user signup. Dimensi billing Auth.
+
+**Magic link**: passwordless login via email. User dapat link, klik = login. Pakai `signInWithOtp({ email })`.
+
+**Migration**: file SQL di `supabase/migrations/` yang dijalankan terurut. Track via timestamp filename. Apply lokal via `supabase db reset`, push prod via `supabase db push`.
+
+## P
+
+**`pg_cron`**: ekstensi untuk schedule SQL job dalam Postgres. Pakai untuk cron task yang tidak butuh external compute.
+
+**`pg_graphql`**: ekstensi yang auto-generate GraphQL endpoint dari Postgres schema. Endpoint default `/graphql/v1`.
+
+**`pg_net`**: ekstensi untuk HTTP request dari SQL function. Pakai untuk trigger Edge Function dari Postgres event, atau panggil API eksternal.
+
+**`pgmq`**: ekstensi message queue dalam Postgres. Drop-in replacement untuk SQS untuk volume kecil-menengah. Pakai pattern: queue baca-tulis dalam SQL.
+
+**`pgvector`**: ekstensi untuk vector embedding storage + similarity search. Kolom `vector(N)`, operator `<=>` `<->` `<#>`, index HNSW/IVFFlat.
+
+**Postgres Changes**: salah satu tiga mode Realtime. Tail replication slot untuk dapat event INSERT/UPDATE/DELETE. RLS otomatis filter per user.
+
+**PostgREST**: service yang auto-generate REST API dari schema Postgres. Endpoint default `/rest/v1`. JWT validate di Kong, forward ke Postgres untuk RLS eval.
+
+**Presence**: salah satu tiga mode Realtime. Track state per-client di channel, sync ke semua subscriber saat berubah. Cocok untuk online list, cursor position state.
+
+**Publication (`supabase_realtime`)**: publication Postgres yang Realtime server tail untuk CDC. Table harus masuk publication ini supaya Postgres Changes mode jalan. `alter publication supabase_realtime add table notes;`
+
+**Publishable key**: format key baru (Juli 2025) pengganti anon key. Format `sb_publishable_...`, opaque token, bisa rotate dan revoke. Aman di-bundle ke frontend.
+
+## R
+
+**Reading replica**: copy Postgres untuk read scaling (Pro plan add-on, region-bound). Tidak ada active-active multi-region write di Supabase.
+
+**REPLICA IDENTITY**: setting per-table Postgres yang nentuin kolom apa yang masuk ke replication slot. Default = PK only. `replica identity full` = semua kolom. Affect Realtime UPDATE event payload.
+
+**Replication slot**: konsep Postgres untuk stream WAL ke consumer (Realtime server, atau replica). `supabase_realtime` adalah slot logical Supabase. Monitor via `pg_replication_slots`.
+
+**RLS (Row Level Security)**: fitur Postgres untuk per-row authorization via policy SQL. Supabase pakai jadi mekanisme authorization umum. Tanpa enable RLS, policy ditulis tapi tidak aktif.
+
+**RPC (Remote Procedure Call)**: function Postgres yang di-expose via PostgREST. Call lewat SDK: `supabase.rpc('function_name', params)`. Pakai untuk operasi yang tidak fit CRUD.
+
+## S
+
+**SDK**: library client untuk akses Supabase. `@supabase/supabase-js` untuk JS/TS umum, `@supabase/ssr` untuk SSR framework (Next.js, Remix, SvelteKit).
+
+**Secret key**: format key baru (Juli 2025) pengganti service_role. Format `sb_secret_...`. Bypass RLS, server-only.
+
+**SECURITY DEFINER**: function modifier Postgres yang jalan dengan permission owner function, bukan caller. Bypass RLS. Pakai untuk helper authorization (hindari RLS recursion). Selalu set `search_path = ''`.
+
+**SECURITY INVOKER**: function modifier default. Function jalan dengan permission caller. RLS apply normal. Pakai untuk function user-facing (mis. similarity search yang per-user).
+
+**Service role**: nama legacy untuk admin key (replaced by secret key July 2025). Bypass RLS. Cuma di server-only context.
+
+**Signed URL**: URL temporary untuk akses file private bucket. Generate via `createSignedUrl(path, expiresIn)`. Valid sampai expire, tidak butuh JWT.
+
+**Studio**: web dashboard Supabase untuk eksplorasi data, SQL editor, user manager, log viewer. Lokal di port 54323, production di `supabase.com/dashboard`.
+
+**`supabase_realtime`**: publication Postgres yang Realtime server tail. Lihat **Publication**.
+
+## T
+
+**TUS (The Upload Server)**: open protocol untuk resumable upload. Supabase Storage support TUS via endpoint `/storage/v1/upload/resumable`. Client library: `tus-js-client`, `Uppy`.
+
+## V
+
+**`vector(N)`**: kolom Postgres dengan tipe vector dimensi N. Disediakan ekstensi pgvector. Pakai N sesuai model embedding (1536 untuk OpenAI text-embedding-3-small).
+
+**Vault (`supabase_vault`)**: ekstensi secret manager dalam Postgres. Simpan sensitive value encrypted, akses via function. Pakai untuk: API key yang diakses dari function trigger.
+
+## W
+
+**Webhook**: HTTP callback dari service eksternal ke Edge Function. Receiver verify HMAC signature, proses payload. Common pattern untuk integrasi Stripe, Notion, GitHub.
+
+**Workflow (RLS)**: pola tracking RLS sebagai code (migration + pgTAP test + CI gate). Lihat [RLS Workflow](/id/supabase/tools/rls-workflow).
+
+## Setelah ini
+
+- Project model dan environment: [Project Model](/id/supabase/foundation/project-model)
+- Pricing dimensi: [Billing](/id/supabase/foundation/billing)
+- Service deep page: [Service Reference](/id/supabase/services)
