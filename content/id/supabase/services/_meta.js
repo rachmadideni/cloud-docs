@@ -2,5 +2,6 @@ export default {
   index: 'Overview',
   database: 'Database (Postgres)',
   auth: 'Auth (GoTrue)',
-  storage: 'Storage'
+  storage: 'Storage',
+  'edge-functions': 'Edge Functions'
 }

@@ -1,0 +1,535 @@
+# Edge Functions
+
+**TL;DR**: Serverless function di Deno runtime, deploy ke edge network global Supabase. Tight integration dengan Auth dan Database lewat env var auto-inject. Ideal untuk: panggil API eksternal pakai secret, webhook receiver, background job, kompute yang tidak fit di Postgres function.
+
+**Analogi**: AWS Lambda alternative dengan tiga perbedaan struktural: (1) Deno bukan Node, (2) tight integration dengan Supabase Auth + DB built-in, (3) deploy single command tanpa zip + layer + IAM.
+
+## Perfect use-case
+
+- Panggil API eksternal yang butuh secret key (AI provider, Stripe, Mailgun, dll)
+- Webhook receiver dari service eksternal (Stripe, Notion, GitHub)
+- Background job triggered dari Postgres event (via pg_net + trigger)
+- Compute yang heavy untuk Postgres function tapi tidak butuh long-running infra (1-150 detik)
+- WebSocket relay (mis. proxy ke OpenAI Realtime API)
+- File processing on-upload (resize, OCR, virus scan) dari Storage trigger
+
+## Anti use-case
+
+- Long-running job di atas 150 detik. Pakai queue + worker dedicated (Cloud Run, ECS).
+- Heavy ML inference yang butuh GPU. Pakai Modal, RunPod, atau Bedrock.
+- Native binding berat (image processing dengan sharp, PDF dengan poppler). Deno runtime tidak support semua native binding npm.
+- Cron job sederhana yang cuma butuh query DB. Pakai pg_cron, hindari roundtrip ke function.
+- Service-to-service call internal di project Supabase yang sama (mis. trigger compute setelah insert). pg_net + pgmq lebih reliable.
+
+## Pricing mental model
+
+| Dimensi | Free | Pro | Beyond |
+|---|---|---|---|
+| Invocation | 500K/bulan | 2M/bulan | $2/M |
+| Max execution | 25 detik | 150 detik | sama |
+| CPU time | included | included | metered over-quota |
+| Egress response | hitung di Bandwidth | hitung di Bandwidth | hitung di Bandwidth |
+| Background task | included | included | included |
+| WebSocket connection | 100 concurrent | 500 concurrent | add-on |
+
+Yang sering miss:
+
+- **Invocation dari DB trigger via pg_net hitung sama**. Jangan loop trigger yang tidak perlu, gampang habis quota.
+- **External API cost terpisah**. Anthropic, OpenAI, Stripe semua billing langsung ke provider. Edge Function cuma proxy.
+- **Egress = response body**. Function return 10 MB image transform = 10 MB egress.
+
+## Local emulator
+
+Container Edge Runtime jalan default lewat `supabase start`. Tapi function code TIDAK di-load otomatis. Harus jalankan terminal terpisah:
+
+```bash
+# Terminal 1
+supabase start
+
+# Terminal 2
+supabase functions serve --env-file supabase/functions/.env
+```
+
+Function tab 2 hot-reload tiap save. Endpoint lokal:
+
+```
+http://127.0.0.1:54321/functions/v1/<function-name>
+```
+
+Detail container di [Tools / Local Stack](/id/supabase/tools/local-stack).
+
+## Hello-world
+
+```bash
+supabase functions new hello-world
+```
+
+Edit `supabase/functions/hello-world/index.ts`:
+
+```ts
+Deno.serve(async (req) => {
+  const { name } = await req.json()
+  return Response.json({ message: `Hello ${name}!` })
+})
+```
+
+Serve + test:
+
+```bash
+supabase functions serve
+
+curl -X POST http://127.0.0.1:54321/functions/v1/hello-world \
+  -H "Authorization: Bearer <anon-key>" \
+  -H "Content-Type: application/json" \
+  -d '{"name":"world"}'
+```
+
+Deploy:
+
+```bash
+supabase functions deploy hello-world
+```
+
+End-to-end pattern dengan auth + DB + AI provider di [S4 journey](/id/supabase/journeys/s4-edge-function).
+
+## Deno runtime
+
+Edge Function jalan di Deno 2 (terbaru per CLI 2.x). Karakteristik penting:
+
+### Import pattern
+
+Tidak ada `package.json`, tidak ada `node_modules`. Import via:
+
+```ts
+// JSR (Deno registry, paling clean)
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+// URL HTTPS (Deno standard lama, masih works)
+import { serve } from 'https://deno.land/std@0.170.0/http/server.ts'
+
+// npm: prefix (compat layer untuk npm package)
+import Stripe from 'npm:stripe@14'
+import { z } from 'npm:zod'
+
+// node: prefix untuk Node.js built-in module
+import { crypto } from 'node:crypto'
+```
+
+Prioritas pakai JSR untuk package Deno-native, `npm:` untuk yang udah ada di npm registry.
+
+### Native API yang tersedia
+
+- `fetch`, `Request`, `Response`, `Headers`: Web Standard
+- `crypto.subtle`: Web Crypto
+- `Deno.env`: environment variable access
+- `Deno.serve`: HTTP server (pengganti `serve` lama)
+- `Deno.upgradeWebSocket`: WebSocket support
+- `TextEncoder`, `TextDecoder`
+- Stream API (`ReadableStream`, `WritableStream`)
+
+Tidak ada (relative ke Node): `require`, `process`, `__dirname`, `module.exports`. Pakai ES module syntax.
+
+### npm package compatibility
+
+Sebagian besar package npm pure JavaScript jalan via `npm:` prefix. Tidak jalan:
+
+- Package dengan native binding (`sharp`, `node-canvas`, `bcrypt`, `argon2`). Cari Deno-native alternative.
+- Package yang bergantung pada `child_process` atau filesystem operasi kompleks.
+- Package CommonJS lama yang tidak support ESM (jarang, sebagian besar sudah migrate).
+
+Cek `npm:` compat: import + test lokal. Kalau ke-load tanpa error, biasanya jalan.
+
+## Auth modes
+
+Default: function require JWT. Authorization header valid yang issued GoTrue dibutuhkan untuk akses.
+
+### Mode 1: Verify JWT (default)
+
+```bash
+supabase functions deploy my-function
+# Default: --verify-jwt
+```
+
+Request tanpa Authorization atau JWT invalid auto-rejected dengan 401 di gateway level (Kong), tidak masuk ke function code.
+
+Cocok untuk: function user-facing yang manggil dari client app dengan session login.
+
+### Mode 2: No verify JWT
+
+```bash
+supabase functions deploy webhook-receiver --no-verify-jwt
+```
+
+Function accessible tanpa Authorization header. Function code yang verify legitimacy.
+
+Cocok untuk: webhook receiver, cron job triggered eksternal, public endpoint.
+
+Verifikasi alternatif di function code:
+
+```ts
+// Webhook signature verification
+const signature = req.headers.get('x-stripe-signature')
+const isValid = verifyStripeSignature(body, signature, secret)
+if (!isValid) return new Response('forbidden', { status: 401 })
+
+// Internal secret untuk cron
+const internalSecret = req.headers.get('x-internal-secret')
+if (internalSecret !== Deno.env.get('INTERNAL_SECRET')) {
+  return new Response('forbidden', { status: 401 })
+}
+```
+
+## Secret + environment
+
+Function butuh akses ke API key, internal secret, dll. Set via CLI:
+
+```bash
+# Single secret
+supabase secrets set STRIPE_SECRET_KEY=sk_live_...
+
+# Bulk dari file
+supabase secrets set --env-file supabase/functions/.env
+
+# List
+supabase secrets list
+
+# Remove
+supabase secrets unset STRIPE_SECRET_KEY
+```
+
+Akses di function:
+
+```ts
+const key = Deno.env.get('STRIPE_SECRET_KEY')
+if (!key) {
+  return Response.json({ error: 'misconfigured' }, { status: 500 })
+}
+```
+
+### Env var auto-inject
+
+Supabase auto-inject ini ke setiap function, tidak perlu set manual:
+
+| Var | Isi |
+|---|---|
+| `SUPABASE_URL` | URL project (mis. `http://kong:8000` lokal, `https://<ref>.supabase.co` prod) |
+| `SUPABASE_ANON_KEY` | Anon/publishable key |
+| `SUPABASE_SERVICE_ROLE_KEY` | Service role key (bypass RLS) |
+| `SUPABASE_DB_URL` | Postgres connection string langsung |
+
+Pakai untuk bikin Supabase client di function:
+
+```ts
+import { createClient } from 'jsr:@supabase/supabase-js@2'
+
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!  // atau ANON_KEY untuk user-context
+)
+```
+
+### Local .env
+
+Lokal pakai file:
+
+```bash
+echo "STRIPE_SECRET_KEY=sk_test_..." > supabase/functions/.env
+
+supabase functions serve --env-file supabase/functions/.env
+```
+
+Tambah `.env` ke `.gitignore`. Jangan commit.
+
+## Auth context: user JWT vs service_role
+
+Tiga skenario typical, dengan pattern berbeda:
+
+### Skenario A: user-context (RLS aktif)
+
+User klik button di app, function panggil DB. Operasi harus respect RLS sebagai user itu.
+
+```ts
+const authHeader = req.headers.get('Authorization')
+
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_ANON_KEY')!,
+  { global: { headers: { Authorization: authHeader! } } }
+)
+
+const { data: { user } } = await supabase.auth.getUser()
+if (!user) return Response.json({ error: 'unauthorized' }, { status: 401 })
+
+// Query DB: RLS apply, cuma data milik user
+const { data: notes } = await supabase.from('notes').select('*')
+```
+
+Pakai untuk: user-facing action (summarize note, generate report, dll).
+
+### Skenario B: admin-context (bypass RLS)
+
+Function trigger oleh cron internal atau webhook eksternal. Tidak ada user context. Butuh akses penuh.
+
+```ts
+const supabase = createClient(
+  Deno.env.get('SUPABASE_URL')!,
+  Deno.env.get('SUPABASE_SERVICE_ROLE_KEY')!
+)
+
+// Query DB: bypass RLS, semua data accessible
+const { data: all_notes } = await supabase.from('notes').select('*')
+```
+
+Pakai untuk: aggregation cron, admin maintenance, webhook handler.
+
+### Skenario C: dual context
+
+Function verify webhook (admin), lalu update data atas nama user spesifik.
+
+```ts
+const supabaseAdmin = createClient(URL, SERVICE_KEY)
+
+// Webhook signature verify pakai admin
+// ...
+
+// Lookup user dari payload
+const userId = payload.user_id
+
+// Update operasi sebagai service role tapi tetap track user
+await supabaseAdmin.from('subscriptions').upsert({
+  user_id: userId,
+  status: 'active'
+})
+```
+
+## Background task
+
+Function biasa harus return response sebelum 150 detik. Background task allow operasi lanjut setelah response dikirim, sampai limit waktu lebih panjang.
+
+```ts
+Deno.serve(async (req) => {
+  const { data } = await req.json()
+
+  // Trigger background work
+  EdgeRuntime.waitUntil((async () => {
+    // Long-running task, max ~150 detik tambahan
+    await processInBackground(data)
+  })())
+
+  // Return cepat
+  return Response.json({ accepted: true }, { status: 202 })
+})
+```
+
+Pakai untuk: kirim email batch, generate report, sync data ke external. Client tidak nunggu.
+
+## WebSocket
+
+Edge Function bisa upgrade ke WebSocket:
+
+```ts
+Deno.serve(async (req) => {
+  const upgrade = req.headers.get('upgrade') || ''
+  if (upgrade.toLowerCase() !== 'websocket') {
+    return new Response('expected websocket', { status: 426 })
+  }
+
+  const { socket, response } = Deno.upgradeWebSocket(req)
+
+  socket.onopen = () => console.log('connected')
+  socket.onmessage = (e) => socket.send(`echo: ${e.data}`)
+  socket.onclose = () => console.log('disconnected')
+
+  return response
+})
+```
+
+Untuk relay ke service eksternal (mis. OpenAI Realtime API), buka WebSocket kedua dari function ke service, proxy message.
+
+Pakai untuk: chat assistant, multiplayer game state proxy, custom realtime layer (kalau Supabase Realtime tidak fit).
+
+## Custom domain
+
+Default function URL: `https://<project-ref>.supabase.co/functions/v1/<name>`.
+
+Pasang custom domain di Dashboard > Edge Functions > Domains. CNAME ke target Supabase. SSL auto-issued.
+
+```
+https://api.example.com/v1/summarize-note
+```
+
+Cocok untuk: webhook receiver yang publish ke partner (mereka liat domain kamu, bukan supabase.co).
+
+## Logging
+
+Function pakai `console.log`, `console.error`, dll. Output masuk ke logs Supabase.
+
+Live tail lokal:
+
+```bash
+# Terminal yang jalanin functions serve menampilkan log realtime
+```
+
+Live tail prod:
+
+```bash
+supabase functions logs <function-name>
+```
+
+Atau lewat Dashboard: Edge Functions > Logs. Filter by status, time range, search keyword.
+
+### Structured logging
+
+Untuk observability serius, ship log JSON-structured:
+
+```ts
+function log(level: string, msg: string, meta: Record<string, unknown> = {}) {
+  console.log(JSON.stringify({ level, msg, ts: new Date().toISOString(), ...meta }))
+}
+
+Deno.serve(async (req) => {
+  const requestId = crypto.randomUUID()
+  log('info', 'request received', { requestId, path: req.url })
+
+  try {
+    // ... work
+    log('info', 'request done', { requestId, duration: 123 })
+  } catch (err) {
+    log('error', 'request failed', { requestId, error: (err as Error).message })
+    throw err
+  }
+})
+```
+
+Dashboard search jadi gampang berdasarkan field.
+
+## Gotcha
+
+### Body request stream sekali
+
+`await req.json()` consume body. Panggil lagi error. Untuk webhook butuh raw body (signature verify), pakai `await req.text()` dulu, parse manual setelah.
+
+### CORS lupa setup
+
+Function di-call dari browser perlu CORS preflight. Tanpa handler, browser block.
+
+```ts
+const corsHeaders = {
+  'Access-Control-Allow-Origin': '*',
+  'Access-Control-Allow-Headers': 'authorization, x-client-info, apikey, content-type'
+}
+
+if (req.method === 'OPTIONS') {
+  return new Response('ok', { headers: corsHeaders })
+}
+```
+
+`supabase.functions.invoke()` SDK auto-handle CORS, raw `fetch()` perlu manual.
+
+### Cold start
+
+Function tidak dipanggil dalam beberapa menit jadi cold. Cold start ~50-100ms. Untuk endpoint sensitive latency, pre-warm dengan cron ping `/health` tiap 5 menit. Tapi pertimbangkan: 100ms biasanya OK untuk user-facing.
+
+### Function panggil function
+
+Latency add up, tracing susah, debug sulit. Hindari chain. Refactor jadi satu function dengan logic linear, atau pakai queue untuk decoupling.
+
+### Service role key bocor di error response
+
+```ts
+catch (err) {
+  return Response.json({ error: err.message }, { status: 500 })
+}
+```
+
+Error dari Supabase SDK kadang include URL dengan service_role token. Sanitize:
+
+```ts
+catch (err) {
+  console.error(err)  // full di log server
+  return Response.json({ error: 'internal error' }, { status: 500 })  // generic ke client
+}
+```
+
+### Tidak ada filesystem persisten
+
+Function ephemeral. Tulis ke `/tmp` allowed dalam request lifecycle, tidak persist antar invocation. Untuk file processing, baca dari Storage, proses di memori, upload balik.
+
+### Cron job langsung dari Postgres
+
+Kalau cuma butuh "tiap menit query + update", pakai pg_cron langsung di Postgres. Tidak perlu function. Function overhead invocation extra. Pattern:
+
+```sql
+-- Direct di Postgres, ga butuh function
+select cron.schedule('cleanup', '*/10 * * * *', $$
+  delete from sessions where expires_at < now();
+$$);
+```
+
+Function kalau butuh: external HTTP call, complex logic yang lebih cocok di TS daripada SQL.
+
+### Secret rotation manual
+
+Set secret persist sampai di-rotate manual. Untuk rotation automatic (mis. kalau company policy):
+
+```bash
+# CI cron
+new_key=$(openssl rand -hex 32)
+supabase secrets set INTERNAL_SECRET=$new_key
+# update juga di postgres setting
+psql -c "alter database postgres set app.internal_secret = '$new_key'"
+```
+
+### Deploy gagal silent
+
+Function gagal compile (TypeScript error, syntax error) di-deploy bisa silent kalau CLI versi lama. Cek selalu `supabase functions logs` setelah deploy untuk verify function jalan, atau hit endpoint dengan smoke test.
+
+### Region default us-east-1
+
+Function deploy ke region project, default `us-east-1`. Untuk audience Indonesia, latency 200-300ms baseline. Pertimbangkan project di Singapore region (`ap-southeast-1`) saat bikin project baru.
+
+### npm package size limit
+
+Function bundle limit ~20 MB (compressed). Package dengan banyak dependency (mis. AWS SDK full) lewat limit. Pakai tree-shake import:
+
+```ts
+// JANGAN
+import * as AWS from 'npm:@aws-sdk/client-s3'
+
+// IYA
+import { S3Client, PutObjectCommand } from 'npm:@aws-sdk/client-s3'
+```
+
+## Cross-provider
+
+| Capability | Supabase Edge Function | AWS Lambda | Cloudflare Workers | Vercel Function | Deno Deploy |
+|---|---|---|---|---|---|
+| Runtime | Deno 2 | Node, Python, Go, Java, custom | V8 isolate (Node compat layer) | Node, Edge runtime | Deno |
+| Cold start | 50-100ms | 100-3000ms (zip size) | sub-5ms | 100-500ms | 50-100ms |
+| Max execution | 150s (Pro) | 15 menit | 30s paid | 300s | 60s default |
+| Module loading | URL, JSR, npm: | layer + zip | bundled | npm install | URL, JSR |
+| Native binding | tidak | ya (zip) | tidak | terbatas | tidak |
+| WebSocket | ya | API Gateway + ws wrapper | ya (Durable Object) | ya | ya |
+| Secret management | `supabase secrets` | Secrets Manager + SSM | wrangler secrets | Vercel env | env / Deno KV |
+| Local emulator | `functions serve` | SAM Local | wrangler dev | `vercel dev` | `deno run` |
+| Tight DB integration | auto-inject SUPABASE_* | manual SDK + IAM | manual | manual | manual |
+| Custom domain | built-in | API Gateway | built-in | built-in | built-in |
+| Background task | EdgeRuntime.waitUntil | tidak (pakai SQS) | event.waitUntil | tidak | tidak |
+
+Positioning: Edge Function low-friction untuk Supabase project. Tight Auth + DB integration jadi differentiator. Untuk workload native binding (sharp, onnxruntime), Lambda atau Vercel Function lebih cocok. Untuk latency sub-10ms global, Workers.
+
+## Anti-pattern
+
+- **Service role default untuk semua function**: bypass RLS, hilang security benefit. Pakai user JWT kecuali butuh elevated access.
+- **Hardcode secret di kode function**: pakai `Deno.env.get()` + `supabase secrets set`. Jangan commit.
+- **Function panggil function**: latency add up, tracing susah. Refactor.
+- **Return error detail di production**: bocor info internal. Sanitize, log full di server.
+- **Pakai function untuk operasi yang fit di Postgres function**: function ada overhead invocation. SQL function langsung lebih cepat dan murah untuk query manipulation pure.
+- **Skip rate limit**: spam endpoint = bill API provider naik. Implement rate limit (Redis, Postgres counter) atau Kong layer.
+
+## Setelah ini
+
+- Pattern AI proxy + webhook end-to-end: [S4 journey](/id/supabase/journeys/s4-edge-function)
+- RAG dengan embed-notes worker via Edge Function: [S5 journey](/id/supabase/journeys/s5-rag)
+- Pattern background task + cron + queue: [Database / Workflow](/id/supabase/services/database#workflow-contoh-rag-pakai-pgvector--pgmq--pg_cron)
+- Track deployment as code: [Tools / Workflow](/id/supabase/tools/workflow)
