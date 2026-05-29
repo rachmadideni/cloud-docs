@@ -5,5 +5,6 @@ export default {
   storage: 'Storage',
   'edge-functions': 'Edge Functions',
   realtime: 'Realtime',
-  vector: 'Vector (pgvector)'
+  vector: 'Vector (pgvector)',
+  studio: 'Studio'
 }
