@@ -1,0 +1,110 @@
+# ECR (Elastic Container Registry)
+
+**TL;DR**: Docker registry private AWS. Push image dari laptop atau CI, pull dari ECS/EKS/Lambda. Storage murah, transfer dalam region gratis. Built-in vulnerability scan via Inspector.
+
+## Analogi
+
+Docker Hub private milik akun AWS kamu. Sama API standard Docker, plus auth via IAM.
+
+## Kapan pakai
+
+- ✅ Image untuk ECS/EKS/App Runner/Lambda container image.
+- ✅ Private registry untuk team internal.
+- ✅ Image dengan vulnerability scan otomatis (Inspector integration).
+- ✅ Multi-region replication untuk app yang deploy di banyak region.
+- ✅ Pull-through cache (mirror Docker Hub atau registry public lain untuk hindari rate limit).
+
+## Kapan jangan
+
+- ❌ Public image. Pakai Docker Hub atau ECR Public.
+- ❌ Image bersih tiap push tanpa lifecycle. Storage menumpuk = mahal.
+- ❌ Cross-account push tanpa setup permission. Ribet, mungkin lebih simpel pakai shared account.
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| Storage | $0.10/GB/bulan |
+| Data transfer in | gratis |
+| Data transfer in-region | gratis |
+| Data transfer egress internet | standard $0.09/GB |
+| Vulnerability scan | $0.09 per scan (enhanced via Inspector) |
+
+Image 200 MB × 50 image version = 10 GB = $1/bulan. Murah.
+
+Tagihan kaget:
+- **Old image tidak di-clean**: tag `latest` dan version lama menumpuk. Set lifecycle policy.
+- **Cross-region replication**: bayar storage di region tujuan, plus transfer.
+
+## Local emulator
+
+**Floci status**: ✅ full (OCI registry beneran), Floci-exclusive vs LocalStack Free
+
+```bash
+# Bikin repo
+awsl ecr create-repository --repository-name my-app
+
+# Login Docker
+awsl ecr get-login-password | docker login --username AWS \
+  --password-stdin localhost:4566
+
+# Tag dan push
+docker tag my-app:latest localhost:4566/my-app:latest
+docker push localhost:4566/my-app:latest
+```
+
+Pull dari container lain (ECS task) yang spawn di Docker host yang sama: works native.
+
+## Hello-world
+
+```bash
+# Bikin repo
+awsl ecr create-repository --repository-name fargate-demo
+
+REPO_URI=$(awsl ecr describe-repositories \
+  --repository-names fargate-demo \
+  --query 'repositories[0].repositoryUri' --output text)
+echo "Repo: $REPO_URI"
+
+# Build local image
+cat > Dockerfile << 'EOF'
+FROM nginx:alpine
+EOF
+docker build -t fargate-demo .
+
+# Tag dan push
+docker tag fargate-demo:latest $REPO_URI:latest
+awsl ecr get-login-password | docker login --username AWS \
+  --password-stdin $(echo $REPO_URI | cut -d/ -f1)
+docker push $REPO_URI:latest
+
+# List image di repo
+awsl ecr list-images --repository-name fargate-demo
+```
+
+## Gotcha
+
+- **Auth token expire 12 jam**: re-login tiap kali atau pakai `ecr-credential-helper`.
+- **Repository name lock to lowercase**: `MyApp` tidak boleh, harus `my-app`. Match Docker convention.
+- **Tag mutable default**: push tag yang sama overwrite previous. Untuk produksi, set immutable agar prevent accidental replace.
+- **Image scan opt-in per repo**: enable scan-on-push lewat repository setting. Basic scan gratis, enhanced (Inspector) berbayar.
+- **Lifecycle policy mandatory di production**: tanpa policy, image lama menumpuk. Contoh policy: keep 10 most recent, expire older than 30 days.
+- **Cross-region pull mahal di transfer**: deploy multi-region tanpa replication = pull lintas-region tiap deploy. Setup ECR Replication.
+- **Pull-through cache**: konfigurasi proxy ke Docker Hub/Quay/etc. Hindari rate limit Docker Hub anonymous (100 pull/6 jam).
+- **EKS pull image butuh IAM permission di node**: node group role butuh `AmazonEC2ContainerRegistryReadOnly`.
+- **Public vs Private ECR berbeda**: ECR Public di registry `public.ecr.aws`, beda dashboard, free egress.
+- **Image manifest v2 vs OCI**: ECR support keduanya, tapi tool lama (Docker < 19) mungkin tidak.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Container Registry (ACR) | mirip, ada geo-replication built-in |
+| GCP | Artifact Registry | superseded Container Registry, broader format support |
+| Oracle | OCI Container Registry | basic |
+| Third-party | Docker Hub, GitHub Container Registry, Quay | sering lebih ergonomic, public option |
+
+## Belajar lebih lanjut
+
+- Pakai ECR di journey: [J8 Container Workload](/id/aws/journeys/j8-container).
+- [AWS ECR docs](https://docs.aws.amazon.com/ecr/).

@@ -1,11 +1,11 @@
 ---
 name: tech-writer
-description: Technical writing guide for Cloud Docs project. Activates when writing or editing MDX content under content/, planning documentation structure, or drafting any prose that will be published to the docs site. Enforces plain language, anti-AI-fingerprint style, and the locked page template.
+description: Technical writing guide for Pocket Guide project. Activates when writing or editing MDX content under content/, planning documentation structure, or drafting any prose that will be published to the docs site. Enforces plain language, anti-AI-fingerprint style, and the locked page template.
 ---
 
-# Tech Writer Skill — Cloud Docs
+# Tech Writer Skill — Pocket Guide
 
-You are writing for the Cloud Docs project. The reader is an Indonesian developer who codes daily but is new to cloud. They scan first, read second. They came here to solve a problem, not to be impressed.
+You are writing for the Pocket Guide project. The reader is an Indonesian developer who codes daily but is new to cloud. They scan first, read second. They came here to solve a problem, not to be impressed.
 
 Your job is to write so they understand on the first read and can copy-paste something useful within 60 seconds of landing on the page.
 

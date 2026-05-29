@@ -1,0 +1,39 @@
+# Supabase
+
+Open-source BaaS di atas Postgres. Auth, database, storage, realtime, edge function, dan pgvector dalam satu project. Local dev real lewat `supabase start` (Docker compose internal).
+
+> **Status: On Progress.** Konten masih skeleton. Halaman akan diisi bertahap mengikuti pola yang sama dengan section AWS (use-case journey + service deep page + tools).
+
+## Mulai dari mana?
+
+- Baru kenal Supabase? Mulai dari [Fondasi](/id/supabase/foundation).
+- Mau bikin sesuatu konkret? Buka [Use-Case Journey](/id/supabase/journeys).
+- Cari service spesifik? Cek [Service Reference](/id/supabase/services).
+- Setup local dev dan CLI? Lihat [Tools & Local Dev](/id/supabase/tools).
+
+## Target Use-Case Journey
+
+Rencana journey (placeholder, akan ditulis bertahap):
+
+| ID | Journey | Komponen |
+|---|---|---|
+| S1 | Auth + CRUD dengan RLS | Auth, Postgres, RLS policy |
+| S2 | File upload via Storage | Storage, signed URL, transform |
+| S3 | Realtime subscriptions | Realtime, broadcast, presence |
+| S4 | Edge Function + Webhook | Edge Function, Deno, secrets |
+| S5 | RAG dengan pgvector | Postgres + pgvector, embedding |
+| S6 | Migration & local dev workflow | Supabase CLI, branching, migrasi |
+
+## Target Service Reference
+
+- Database (Postgres + ekstensi)
+- Auth (JWT, OAuth, MFA)
+- Storage (S3-compatible)
+- Edge Functions (Deno)
+- Realtime (Postgres CDC, broadcast, presence)
+- Vector (pgvector)
+- Studio (dashboard)
+
+## Local Dev
+
+`supabase start` jalanin full stack (Postgres + GoTrue + Storage + Realtime + Edge Runtime) via Docker compose. Single command, no manual setup. Detail di [Tools & Local Dev](/id/supabase/tools).

@@ -1,0 +1,124 @@
+# EventBridge
+
+**TL;DR**: Event bus serverless dengan routing rule pattern-matching. Lebih advanced dari SNS untuk decouple publisher-subscriber. Bisa terima event dari AWS service, SaaS partner (Stripe, Datadog), atau custom app. Plus scheduler built-in untuk cron.
+
+## Analogi
+
+Switchboard operator. Pesan masuk di-tag dengan source dan type. Operator route ke tujuan yang match rule. Tujuan tidak perlu tahu siapa pengirim, pengirim tidak peduli siapa yang terima.
+
+## Kapan pakai
+
+- ✅ Decouple app dengan banyak event type dan banyak consumer.
+- ✅ Routing berbasis content (mis. order amount > 10 juta route ke fraud-team).
+- ✅ Integrate SaaS event (Stripe webhook, GitHub event, Salesforce).
+- ✅ Schedule task pakai EventBridge Scheduler (replace CloudWatch Events Cron).
+- ✅ Schema discovery dan registry untuk event-driven architecture.
+- ✅ Archive event untuk replay nanti.
+
+## Kapan jangan
+
+- ❌ Simple pub/sub 1-2 subscriber. SNS lebih simpel dan murah.
+- ❌ Need ordered guarantee per event. EventBridge tidak garansi order.
+- ❌ Streaming high-volume (>10k event/detik per rule). Pakai Kinesis.
+
+## EventBridge vs SNS vs SQS
+
+| Faktor | EventBridge | SNS | SQS |
+|---|---|---|---|
+| Pattern | bus + rules | topic + subscribers | queue |
+| Pesan persist | tidak (archive opt) | tidak | iya |
+| Filter routing | pattern-matching kompleks | basic attribute filter | tidak |
+| Fanout | iya | iya | tidak (1 consumer) |
+| Schema discovery | iya | tidak | tidak |
+| Cost per juta | $1.00 | $0.50 | $0.40 |
+
+Aturan praktis: pakai EventBridge kalau arsitektur tumbuh kompleks. SNS/SQS untuk simple decouple.
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| Custom event PutEvents | $1.00 per 1 juta |
+| AWS service event | gratis |
+| Partner event | gratis |
+| Replay event | $1.00 per 1 juta |
+| Archive | $0.10 per GB/bulan |
+| Scheduler | $1.00 per 1 juta invocation |
+
+Untuk app 100k event/bulan: ~$0.30/bulan. Sangat murah.
+
+## Local emulator
+
+**Floci status**: ✅ full (rule + scheduler)
+
+```bash
+# Custom bus
+awsl events create-event-bus --name orders-bus
+
+# Rule yang match event tertentu
+awsl events put-rule --name route-orders \
+  --event-bus-name orders-bus \
+  --event-pattern '{"source":["orders.api"],"detail-type":["order.created"]}'
+
+# Target: SQS queue
+awsl events put-targets --rule route-orders \
+  --event-bus-name orders-bus \
+  --targets "Id=1,Arn=$QUEUE_ARN"
+```
+
+## Hello-world
+
+```bash
+# Publish event
+awsl events put-events --entries '[{
+  "EventBusName": "orders-bus",
+  "Source": "orders.api",
+  "DetailType": "order.created",
+  "Detail": "{\"orderId\":\"123\",\"amount\":250000}"
+}]'
+```
+
+Subscriber yang match `source: orders.api` AND `detail-type: order.created` akan terima event di field `detail`.
+
+Pattern filter lebih canggih:
+
+```json
+{
+  "source": ["orders.api"],
+  "detail-type": ["order.created"],
+  "detail": {
+    "amount": [{"numeric": [">", 1000000]}],
+    "currency": ["IDR"]
+  }
+}
+```
+
+Cuma route order yang amount > 1 juta dan currency IDR. Filter di-evaluate before invoke target, hemat cost downstream.
+
+## Gotcha
+
+- **Event format envelope**: payload publisher di-wrap di field `detail`. Consumer harus parse `.detail` (atau pakai `InputPath: $.detail` di Step Functions target untuk strip).
+- **Rule pattern tidak support OR antar field**: untuk OR, bikin multiple rule dengan target sama.
+- **Max 5 target per rule**: untuk fanout lebih banyak, bikin rule duplikat atau pakai SNS topic sebagai 1 target yang fanout.
+- **Cross-region event**: bisa, tapi setup butuh resource-based policy di destination bus.
+- **Archive size unlimited tapi cost storage S3-like**: archive panjang = bayar storage. Set retention.
+- **Replay tidak garansi order**: walau event masuk berurutan ke archive, replay paralel ke target. Jangan asumsi ordering.
+- **Scheduler vs Rule with schedule expression**: EventBridge Scheduler (2022+) lebih canggih: schedule one-time, flexible-window, timezone support. Rule cron legacy.
+- **Scheduler dead letter handler**: kalau target invoke gagal, default lost. Setup DLQ per schedule.
+- **Custom bus vs default bus**: default bus untuk AWS service event. Custom bus untuk app event kamu. Pisahkan untuk isolation per env (dev/staging/prod).
+- **Schema registry feature**: enable schema discovery untuk auto-detect event schema dari traffic. Berguna untuk generate code binding.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Event Grid | mirip konsep |
+| Azure | Service Bus Topic | basic pub/sub |
+| GCP | Eventarc | trigger Cloud Run/Functions dari event |
+| GCP | Pub/Sub | streaming + pub/sub |
+| Self-hosted | Apache NATS, Kafka | open source alternative |
+
+## Belajar lebih lanjut
+
+- Pakai EventBridge di journey: [J5 Event-Driven](/id/aws/journeys/j5-event-driven).
+- [AWS EventBridge docs](https://docs.aws.amazon.com/eventbridge/).

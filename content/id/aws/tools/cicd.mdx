@@ -1,0 +1,393 @@
+# CI/CD
+
+Otomasi test + deploy via pipeline. Floci di GitHub Actions atau GitLab CI untuk integration test. Deploy ke AWS asli via OIDC (tanpa long-term key).
+
+## Konsep
+
+| Step | Tool |
+|---|---|
+| Lint + unit test | tooling per bahasa (eslint, pytest, dll) |
+| Integration test (need AWS) | Floci sebagai service container |
+| Build artifact | docker build, zip Lambda |
+| Deploy infrastructure | Terraform / CDK / SAM |
+| Deploy code | aws-cli upload, image push, kubectl apply |
+| Smoke test | curl endpoint setelah deploy |
+| Rollback | re-deploy previous version, atau IaC plan reverse |
+
+## GitHub Actions
+
+### Setup OIDC (tanpa AWS access key di secret)
+
+1. Buat OIDC provider di AWS:
+
+```bash
+aws iam create-open-id-connect-provider \
+  --url https://token.actions.githubusercontent.com \
+  --client-id-list sts.amazonaws.com \
+  --thumbprint-list 6938fd4d98bab03faadb97b34396831e3780aea1
+```
+
+2. Buat IAM role yang trust GitHub OIDC:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Allow",
+    "Principal": {
+      "Federated": "arn:aws:iam::000000000000:oidc-provider/token.actions.githubusercontent.com"
+    },
+    "Action": "sts:AssumeRoleWithWebIdentity",
+    "Condition": {
+      "StringEquals": {
+        "token.actions.githubusercontent.com:aud": "sts.amazonaws.com"
+      },
+      "StringLike": {
+        "token.actions.githubusercontent.com:sub": "repo:my-org/my-repo:*"
+      }
+    }
+  }]
+}
+```
+
+3. Attach permission policy (mis. deploy ke Lambda + S3).
+
+4. Di workflow, assume role:
+
+```yaml
+permissions:
+  id-token: write    # wajib untuk OIDC
+  contents: read
+
+steps:
+  - uses: aws-actions/configure-aws-credentials@v4
+    with:
+      role-to-assume: arn:aws:iam::000000000000:role/github-deploy
+      aws-region: ap-southeast-3
+```
+
+Tidak ada secret access key di GitHub. Token temporary per run.
+
+### Integration test dengan Floci
+
+```yaml
+# .github/workflows/test.yml
+name: Test
+on: [push, pull_request]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      floci:
+        image: floci/floci:latest
+        ports: ['4566:4566']
+        volumes:
+          - /var/run/docker.sock:/var/run/docker.sock
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+
+      - name: Install
+        run: npm ci
+
+      - name: Wait for Floci ready
+        run: |
+          for i in {1..30}; do
+            curl -sf http://localhost:4566/_localstack/health && break
+            sleep 1
+          done
+
+      - name: Integration test
+        env:
+          AWS_ENDPOINT_URL: http://localhost:4566
+          AWS_REGION: us-east-1
+          AWS_ACCESS_KEY_ID: test
+          AWS_SECRET_ACCESS_KEY: test
+        run: npm test
+```
+
+### Deploy Lambda
+
+```yaml
+name: Deploy
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write
+  contents: read
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with: { node-version: '20' }
+
+      - run: npm ci --omit=dev
+      - run: zip -r function.zip . -x '.git*' -x 'tests/*' -x '*.test.js'
+
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::000000000000:role/github-deploy
+          aws-region: ap-southeast-3
+
+      - name: Update function code
+        run: |
+          aws lambda update-function-code \
+            --function-name notes-api \
+            --zip-file fileb://function.zip
+
+      - name: Smoke test
+        run: |
+          sleep 10
+          curl -fsS https://api.example.com/health || exit 1
+```
+
+### Build dan push Docker image ke ECR
+
+```yaml
+- uses: aws-actions/amazon-ecr-login@v2
+  id: ecr
+
+- name: Build, tag, push
+  env:
+    REGISTRY: ${{ steps.ecr.outputs.registry }}
+    REPO: my-app
+    TAG: ${{ github.sha }}
+  run: |
+    docker build -t $REGISTRY/$REPO:$TAG -t $REGISTRY/$REPO:latest .
+    docker push $REGISTRY/$REPO:$TAG
+    docker push $REGISTRY/$REPO:latest
+
+- name: Update ECS service
+  run: |
+    aws ecs update-service \
+      --cluster prod \
+      --service my-app \
+      --force-new-deployment
+```
+
+### Terraform plan di PR, apply di merge
+
+```yaml
+name: Terraform
+on:
+  pull_request:
+    paths: ['terraform/**']
+  push:
+    branches: [main]
+    paths: ['terraform/**']
+
+jobs:
+  plan:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+      pull-requests: write
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::000000000000:role/terraform
+          aws-region: ap-southeast-3
+
+      - run: terraform init
+        working-directory: terraform
+
+      - run: terraform plan -no-color -out=plan.tfplan
+        working-directory: terraform
+
+      - name: Comment plan to PR
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs')
+            const plan = fs.readFileSync('terraform/plan.txt', 'utf8')
+            await github.rest.issues.createComment({
+              issue_number: context.issue.number,
+              owner: context.repo.owner,
+              repo: context.repo.repo,
+              body: '```\n' + plan + '\n```'
+            })
+
+  apply:
+    if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    permissions:
+      id-token: write
+      contents: read
+    steps:
+      - uses: actions/checkout@v4
+      - uses: hashicorp/setup-terraform@v3
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: arn:aws:iam::000000000000:role/terraform
+          aws-region: ap-southeast-3
+
+      - run: terraform init && terraform apply -auto-approve
+        working-directory: terraform
+```
+
+## GitLab CI
+
+### Integration test
+
+```yaml
+# .gitlab-ci.yml
+stages: [test, build, deploy]
+
+variables:
+  AWS_ENDPOINT_URL: http://floci:4566
+  AWS_REGION: us-east-1
+  AWS_ACCESS_KEY_ID: test
+  AWS_SECRET_ACCESS_KEY: test
+
+test:
+  stage: test
+  image: node:20
+  services:
+    - name: floci/floci:latest
+      alias: floci
+  script:
+    - npm ci
+    - npm test
+  cache:
+    paths: [node_modules/]
+```
+
+### Deploy dengan OIDC
+
+GitLab punya `id_tokens` mirip GitHub. Setup IAM role yang trust GitLab OIDC provider.
+
+```yaml
+deploy:
+  stage: deploy
+  image: amazon/aws-cli:latest
+  id_tokens:
+    AWS_ID_TOKEN:
+      aud: https://gitlab.com
+  script:
+    - >
+      export AWS_CREDS=$(aws sts assume-role-with-web-identity
+      --role-arn arn:aws:iam::000000000000:role/gitlab-deploy
+      --role-session-name gitlab-pipeline
+      --web-identity-token "$AWS_ID_TOKEN"
+      --query "Credentials.[AccessKeyId,SecretAccessKey,SessionToken]"
+      --output text)
+    - export AWS_ACCESS_KEY_ID=$(echo $AWS_CREDS | awk '{print $1}')
+    - export AWS_SECRET_ACCESS_KEY=$(echo $AWS_CREDS | awk '{print $2}')
+    - export AWS_SESSION_TOKEN=$(echo $AWS_CREDS | awk '{print $3}')
+    - aws lambda update-function-code --function-name notes-api --zip-file fileb://function.zip
+  only:
+    - main
+```
+
+## Cloudflare Pages (untuk static site)
+
+`drama.supanova.my.id` dan `cloud-docs.supanova.my.id` deploy via CF Pages git integration. Auto-deploy on push, preview per PR.
+
+Setup:
+1. CF dashboard -> Pages -> Connect to Git.
+2. Build settings:
+   - Build command: `npm run build`
+   - Output: `out` (Next.js static export) atau `dist`
+   - Node version env: `NODE_VERSION=20`
+3. Custom domain attach.
+
+Build berjalan di CF infrastructure. Tidak butuh setup GitHub Actions terpisah untuk deploy CF Pages.
+
+## Pattern penting
+
+### Cache dependency
+
+```yaml
+# GitHub Actions
+- uses: actions/setup-node@v4
+  with:
+    node-version: '20'
+    cache: 'npm'   # auto-cache node_modules
+```
+
+```yaml
+# GitLab CI
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths: [node_modules/, .cache/]
+```
+
+### Matrix test multiple environment
+
+```yaml
+strategy:
+  matrix:
+    node: [18, 20, 22]
+    os: [ubuntu-latest, macos-latest]
+runs-on: ${{ matrix.os }}
+steps:
+  - uses: actions/setup-node@v4
+    with: { node-version: ${{ matrix.node }} }
+```
+
+### Conditional deploy per branch
+
+```yaml
+deploy-prod:
+  if: github.ref == 'refs/heads/main'
+
+deploy-staging:
+  if: github.ref == 'refs/heads/develop'
+```
+
+### Manual approval untuk prod
+
+```yaml
+deploy-prod:
+  environment:
+    name: production
+    url: https://app.example.com
+  # GitHub Actions wait for manual approval di Settings -> Environments -> production
+```
+
+### Notify Slack saat fail
+
+```yaml
+- name: Notify Slack
+  if: failure()
+  uses: slackapi/slack-github-action@v1
+  with:
+    payload: |
+      { "text": "Deploy failed in ${{ github.repository }}: ${{ github.event.head_commit.message }}" }
+  env:
+    SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK }}
+```
+
+## Gotcha
+
+- **Floci di GitHub Actions butuh docker socket access**: pakai `volumes: ['/var/run/docker.sock:/var/run/docker.sock']` di service container.
+- **OIDC subject claim strict**: `repo:org/repo:*` cover semua branch. Untuk lebih ketat: `repo:org/repo:ref:refs/heads/main`.
+- **Service container start sebelum step lain**: tapi tidak guarantee siap menerima request. Wait loop atau healthcheck wajib.
+- **Region default**: kalau lupa set, jadi `us-east-1` default. Eksplisit `AWS_REGION`.
+- **Long-running deploy timeout**: GitHub Actions max 6 jam per job. Step timeout default 60 menit. Set lebih kalau perlu.
+- **Cache invalidation**: `cache: 'npm'` cache hash dari `package-lock.json`. Update lock file = cache fresh. Tidak update lock = cache stale potential.
+- **Concurrent deploy clash**: dua PR merge bersamaan, dua workflow apply IaC bersamaan. State lock di Terraform backend. Atau pakai `concurrency` group di GitHub Actions.
+- **Secret leak di log**: jangan `echo $AWS_SECRET_KEY`. GitHub auto-mask, tapi sometimes leak via error message.
+- **Public fork PR**: workflow di-trigger oleh PR dari public fork tidak terima secret (security feature). Pakai `pull_request_target` hati-hati atau review-first approach.
+- **Docker layer cache di runner ephemeral**: cache tidak persist antar run kecuali pakai `actions/cache` atau registry-based cache.
+
+## Belajar lebih lanjut
+
+- [GitHub Actions docs](https://docs.github.com/en/actions).
+- [GitLab CI docs](https://docs.gitlab.com/ee/ci/).
+- [AWS OIDC dengan GitHub Actions guide](https://docs.aws.amazon.com/IAM/latest/UserGuide/id_roles_create_for-idp_oidc.html).
+- Daily workflow: [Dev Workflow](/id/aws/tools/dev-workflow).

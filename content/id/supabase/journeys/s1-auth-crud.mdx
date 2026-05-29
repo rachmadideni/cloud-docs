@@ -1,0 +1,677 @@
+# S1: Auth + CRUD dengan RLS
+
+Bikin notes app: user signup, login, dan kelola catatan sendiri. Per-user isolation di-enforce di database lewat Row Level Security (RLS), bukan di kode aplikasi. Stack: Next.js 15 App Router + Supabase Auth + Postgres. Lokal pakai `supabase start`. End-to-end runnable di laptop.
+
+## Kenapa journey ini dipakai sebagai start
+
+Tiap aplikasi B2C butuh auth. Tiap aplikasi multi-tenant butuh data isolation. Di Supabase, dua hal ini di-handle tight banget oleh RLS: kamu enable security di table, tulis policy SQL, dan `select * from notes` dari client otomatis cuma return baris milik user yang login. Tidak ada `where user_id = ?` di kode. Tidak ada middleware yang ngecek role. Database yang enforce.
+
+Pola ini bedanya jauh sama AWS. Di AWS J2 (REST API serverless), kamu butuh Lambda yang baca claim dari JWT, lalu `dynamodb.query()` dengan filter `user_id = sub`. Kalau lupa filter, semua data bocor. Di Supabase, kamu lupa policy = baris tidak return. Default deny, bukan default allow.
+
+## Skenario
+
+User bisa signup pakai email + password, login, lalu CRUD catatan:
+
+- List catatan yang dia tulis
+- Tambah catatan baru
+- Hapus catatan
+- Tidak bisa lihat atau modifikasi catatan user lain, dijamin DB
+
+## Arsitektur
+
+```mermaid
+flowchart LR
+  Browser[Next.js<br/>App Router]
+  Middleware[Next.js<br/>Middleware]
+  Kong[Kong<br/>:54321]
+  GoTrue[GoTrue<br/>auth]
+  PostgREST[PostgREST<br/>REST API]
+  PG[(Postgres<br/>:54322)]
+  RLS{{RLS policy<br/>auth.uid = user_id}}
+
+  Browser -->|cookies| Middleware
+  Middleware -->|refresh session| Kong
+  Browser -->|signup/login| Kong
+  Browser -->|notes CRUD| Kong
+  Kong --> GoTrue
+  Kong --> PostgREST
+  GoTrue --> PG
+  PostgREST --> RLS
+  RLS --> PG
+```
+
+Komponen kunci:
+
+- **GoTrue** (di balik Kong /auth/v1) handle signup/login, issue JWT
+- **PostgREST** (di balik Kong /rest/v1) auto-generate REST endpoint dari schema, terusin JWT ke Postgres
+- **RLS** di Postgres jadi gerbang akhir, baris yang tidak match policy tidak terlihat
+- **Next.js middleware** refresh session tiap request supaya JWT tidak expired
+
+## Setup lokal
+
+Asumsi: Supabase CLI sudah terinstall (lihat [Tools/Install](/id/supabase/tools)). Docker daemon hidup.
+
+```bash
+mkdir notes-app && cd notes-app
+supabase init
+supabase start
+```
+
+Tunggu sampai stack ready, lalu:
+
+```bash
+supabase status
+```
+
+Catat: `API URL`, `anon key`, `service_role key`. Akan dipakai di env Next.js.
+
+## Step 1: Schema + RLS migrasi
+
+Bikin file migrasi:
+
+```bash
+supabase migration new create_notes_table
+```
+
+Isi `supabase/migrations/<timestamp>_create_notes_table.sql`:
+
+```sql
+-- 1. Bikin table
+create table notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  content text not null check (length(content) > 0),
+  created_at timestamptz not null default now(),
+  updated_at timestamptz not null default now()
+);
+
+-- 2. Index untuk RLS performance
+-- Karena policy filter pakai user_id, kolom ini perlu di-index
+create index notes_user_id_idx on notes(user_id);
+
+-- 3. Enable RLS
+-- Tanpa baris ini, RLS off dan semua orang lihat semua. JANGAN lupa.
+alter table notes enable row level security;
+
+-- 4. Policy: select own notes
+create policy "users can view own notes"
+  on notes for select
+  to authenticated
+  using ( (select auth.uid()) = user_id );
+
+-- 5. Policy: insert with own user_id
+create policy "users can insert own notes"
+  on notes for insert
+  to authenticated
+  with check ( (select auth.uid()) = user_id );
+
+-- 6. Policy: update own notes
+create policy "users can update own notes"
+  on notes for update
+  to authenticated
+  using ( (select auth.uid()) = user_id )
+  with check ( (select auth.uid()) = user_id );
+
+-- 7. Policy: delete own notes
+create policy "users can delete own notes"
+  on notes for delete
+  to authenticated
+  using ( (select auth.uid()) = user_id );
+```
+
+Apply ke lokal:
+
+```bash
+supabase db reset
+```
+
+Verifikasi di Studio (`http://127.0.0.1:54323`): buka Table Editor, table `notes` ada, RLS badge "on" di-display, 4 policy listed.
+
+### Catatan RLS pattern
+
+Tiga hal yang sering dilewat:
+
+1. **`alter table ... enable row level security`** WAJIB. Tanpa ini, policy ditulis tapi tidak aktif. Default Postgres baru = RLS off.
+2. **`(select auth.uid())` lebih cepat dari `auth.uid()`**. Bungkus pakai subquery membuat Postgres cache hasil per query, bukan per row. Penting untuk table besar.
+3. **`to authenticated`** restrict policy hanya ke role authenticated (user login). Role `anon` (belum login) otomatis tidak match, tidak perlu policy terpisah.
+
+## Step 2: Bikin Next.js project
+
+Di folder yang sama (sejajar dengan `supabase/`):
+
+```bash
+npx create-next-app@latest web --typescript --tailwind --app --no-src-dir
+cd web
+npm install @supabase/supabase-js @supabase/ssr
+```
+
+Set env di `web/.env.local`:
+
+```env
+NEXT_PUBLIC_SUPABASE_URL=http://127.0.0.1:54321
+NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon-key-dari-supabase-status>
+```
+
+`SUPABASE_SERVICE_ROLE_KEY` JANGAN ditaruh di sini. Service role bypass RLS, dipakai cuma di server-only context (mis. admin script). Untuk journey ini kita tidak pakai.
+
+> **Catatan key:** `anon key` adalah nama legacy. Juli 2025 Supabase launch `publishable key` (format `sb_publishable_...`) sebagai pengganti, lebih aman karena bisa di-rotate. Lokal CLI masih emit anon key, jadi env var di atas pakai nama lama. Untuk project production baru, kamu mungkin lihat `NEXT_PUBLIC_SUPABASE_PUBLISHABLE_KEY` di Dashboard. Fungsi identik dari sisi RLS. Detail di [Tools/Overview](/id/supabase/tools#catatan-nama-key-anon-vs-publishable).
+
+Generate types dari schema:
+
+```bash
+cd ..
+supabase gen types --lang=typescript --local > web/database.types.ts
+```
+
+## Step 3: Supabase client utility
+
+Bikin dua client: satu untuk browser, satu untuk server (server component + server action).
+
+`web/lib/supabase/client.ts`:
+
+```ts
+import { createBrowserClient } from '@supabase/ssr'
+import type { Database } from '@/database.types'
+
+export function createClient() {
+  return createBrowserClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+  )
+}
+```
+
+`web/lib/supabase/server.ts`:
+
+```ts
+import { createServerClient } from '@supabase/ssr'
+import { cookies } from 'next/headers'
+import type { Database } from '@/database.types'
+
+export async function createClient() {
+  const cookieStore = await cookies()
+
+  return createServerClient<Database>(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll: () => cookieStore.getAll(),
+        setAll: (cookiesToSet) => {
+          try {
+            cookiesToSet.forEach(({ name, value, options }) => {
+              cookieStore.set(name, value, options)
+            })
+          } catch {
+            // Setting cookies dari Server Component akan throw.
+            // Aman di-ignore kalau middleware sudah handle refresh session.
+          }
+        }
+      }
+    }
+  )
+}
+```
+
+## Step 4: Middleware untuk refresh session
+
+Tanpa middleware, JWT bisa expire saat user idle. Middleware refresh tiap request.
+
+`web/middleware.ts`:
+
+```ts
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function middleware(request: NextRequest) {
+  let response = NextResponse.next({ request })
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll: () => request.cookies.getAll(),
+        setAll: (cookiesToSet) => {
+          cookiesToSet.forEach(({ name, value }) =>
+            request.cookies.set(name, value)
+          )
+          response = NextResponse.next({ request })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            response.cookies.set(name, value, options)
+          )
+        }
+      }
+    }
+  )
+
+  // Penting: getUser() trigger token refresh kalau expired
+  const { data: { user } } = await supabase.auth.getUser()
+
+  // Redirect ke /login kalau akses halaman protected tanpa session
+  if (!user && request.nextUrl.pathname.startsWith('/notes')) {
+    const url = request.nextUrl.clone()
+    url.pathname = '/login'
+    return NextResponse.redirect(url)
+  }
+
+  return response
+}
+
+export const config = {
+  matcher: ['/((?!_next/static|_next/image|favicon.ico).*)']
+}
+```
+
+## Step 5: Halaman Signup + Login
+
+`web/app/signup/page.tsx`:
+
+```tsx
+'use client'
+
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { useState } from 'react'
+
+export default function SignupPage() {
+  const router = useRouter()
+  const supabase = createClient()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setError(null)
+
+    const { error } = await supabase.auth.signUp({ email, password })
+
+    if (error) {
+      setError(error.message)
+      return
+    }
+
+    // Default lokal: confirm email off di config.toml,
+    // user langsung bisa login.
+    router.push('/notes')
+    router.refresh()
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="max-w-sm mx-auto mt-20 space-y-4">
+      <h1 className="text-2xl font-bold">Signup</h1>
+      <input
+        type="email"
+        placeholder="email"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        required
+        className="w-full p-2 border rounded"
+      />
+      <input
+        type="password"
+        placeholder="password (min 6 chars)"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        required
+        minLength={6}
+        className="w-full p-2 border rounded"
+      />
+      {error && <p className="text-red-600">{error}</p>}
+      <button type="submit" className="w-full bg-black text-white p-2 rounded">
+        Signup
+      </button>
+    </form>
+  )
+}
+```
+
+`web/app/login/page.tsx`:
+
+```tsx
+'use client'
+
+import { createClient } from '@/lib/supabase/client'
+import { useRouter } from 'next/navigation'
+import { useState } from 'react'
+
+export default function LoginPage() {
+  const router = useRouter()
+  const supabase = createClient()
+  const [email, setEmail] = useState('')
+  const [password, setPassword] = useState('')
+  const [error, setError] = useState<string | null>(null)
+
+  async function handleSubmit(e: React.FormEvent) {
+    e.preventDefault()
+    setError(null)
+
+    const { error } = await supabase.auth.signInWithPassword({ email, password })
+
+    if (error) {
+      setError(error.message)
+      return
+    }
+
+    router.push('/notes')
+    router.refresh()
+  }
+
+  return (
+    <form onSubmit={handleSubmit} className="max-w-sm mx-auto mt-20 space-y-4">
+      <h1 className="text-2xl font-bold">Login</h1>
+      <input
+        type="email"
+        placeholder="email"
+        value={email}
+        onChange={(e) => setEmail(e.target.value)}
+        required
+        className="w-full p-2 border rounded"
+      />
+      <input
+        type="password"
+        placeholder="password"
+        value={password}
+        onChange={(e) => setPassword(e.target.value)}
+        required
+        className="w-full p-2 border rounded"
+      />
+      {error && <p className="text-red-600">{error}</p>}
+      <button type="submit" className="w-full bg-black text-white p-2 rounded">
+        Login
+      </button>
+    </form>
+  )
+}
+```
+
+Sebelum tes, pastikan `[auth.email] enable_confirmations = false` di `supabase/config.toml`. Kalau true, user perlu klik link di Inbucket dulu, ribet untuk dev cepat.
+
+```toml
+[auth.email]
+enable_confirmations = false
+```
+
+Restart: `supabase stop && supabase start`.
+
+## Step 6: Halaman notes (CRUD)
+
+`web/app/notes/page.tsx`:
+
+```tsx
+import { createClient } from '@/lib/supabase/server'
+import { revalidatePath } from 'next/cache'
+import { redirect } from 'next/navigation'
+
+async function createNote(formData: FormData) {
+  'use server'
+  const content = formData.get('content') as string
+  if (!content) return
+
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) redirect('/login')
+
+  await supabase.from('notes').insert({
+    user_id: user.id,
+    content
+  })
+
+  revalidatePath('/notes')
+}
+
+async function deleteNote(formData: FormData) {
+  'use server'
+  const id = formData.get('id') as string
+  const supabase = await createClient()
+  await supabase.from('notes').delete().eq('id', id)
+  revalidatePath('/notes')
+}
+
+async function signOut() {
+  'use server'
+  const supabase = await createClient()
+  await supabase.auth.signOut()
+  redirect('/login')
+}
+
+export default async function NotesPage() {
+  const supabase = await createClient()
+  const { data: { user } } = await supabase.auth.getUser()
+  if (!user) redirect('/login')
+
+  // Tidak ada .eq('user_id', user.id) di sini.
+  // RLS yang filter. Kalau policy salah, ini bocor.
+  const { data: notes } = await supabase
+    .from('notes')
+    .select('id, content, created_at')
+    .order('created_at', { ascending: false })
+
+  return (
+    <main className="max-w-2xl mx-auto mt-10 p-4 space-y-6">
+      <header className="flex justify-between items-center">
+        <h1 className="text-2xl font-bold">Notes</h1>
+        <div className="flex gap-4 items-center text-sm">
+          <span>{user.email}</span>
+          <form action={signOut}>
+            <button className="underline">Logout</button>
+          </form>
+        </div>
+      </header>
+
+      <form action={createNote} className="flex gap-2">
+        <input
+          name="content"
+          required
+          placeholder="Tulis catatan baru..."
+          className="flex-1 p-2 border rounded"
+        />
+        <button className="bg-black text-white px-4 rounded">Add</button>
+      </form>
+
+      <ul className="space-y-2">
+        {notes?.map((note) => (
+          <li key={note.id} className="flex justify-between items-center p-3 border rounded">
+            <span>{note.content}</span>
+            <form action={deleteNote}>
+              <input type="hidden" name="id" value={note.id} />
+              <button className="text-red-600 text-sm">Hapus</button>
+            </form>
+          </li>
+        ))}
+        {!notes?.length && <p className="text-gray-500">Belum ada catatan.</p>}
+      </ul>
+    </main>
+  )
+}
+```
+
+## Step 7: Test golden path
+
+```bash
+cd web
+npm run dev
+```
+
+Buka `http://localhost:3000/signup`:
+
+1. Signup user A: `a@test.com / password123`. Redirect ke `/notes`.
+2. Tambah 2 catatan: "tugas hari ini", "list belanja".
+3. Logout, signup user B: `b@test.com / password123`.
+4. Lihat halaman notes user B: KOSONG.
+
+Ini buktinya RLS jalan. User B tidak lihat catatan user A meskipun query yang sama. Tidak ada filter `user_id` di kode aplikasi, semuanya database yang enforce.
+
+### Test ekstra: coba bypass RLS dari client
+
+Buka browser dev tools, di console:
+
+```js
+const sb = createClient(
+  'http://127.0.0.1:54321',
+  '<anon-key>'
+)
+await sb.from('notes').select('*')
+// Returns: cuma notes milik user yang login.
+// Mau coba .eq('user_id', '<id-user-lain>')? Tetap return kosong.
+```
+
+RLS tidak bisa di-bypass dari client. Anon key cuma jalan dengan role `authenticated` setelah login (atau `anon` kalau belum). Policy `to authenticated` cek role + claim.
+
+## Test edge case
+
+### Insert dengan user_id orang lain
+
+Coba dari kode atau dari Studio SQL editor (saat login sebagai user A):
+
+```sql
+insert into notes (user_id, content)
+values ('<id-user-b>', 'sneak attack');
+```
+
+Hasil: error `new row violates row-level security policy`. Policy `with check ( (select auth.uid()) = user_id )` block insert ini.
+
+### Update notes orang lain
+
+Sama, error policy violation.
+
+### Direct query ke Postgres tanpa JWT
+
+Connect via `psql postgresql://postgres:postgres@127.0.0.1:54322/postgres`:
+
+```sql
+select * from notes;
+```
+
+Hasil: SEMUA notes. Kenapa? Karena `postgres` role di-grant `bypass row-level security` secara default. Ini fitur, bukan bug, tapi penting diingat: tools admin (psql, Studio SQL editor dengan service role) bypass RLS. Jangan bingung kalau test dari sini hasilnya beda.
+
+## Deploy ke production
+
+Lokal sudah jalan. Deploy ada 3 step:
+
+1. Bikin project di [supabase.com/dashboard](https://supabase.com/dashboard), catat `project-ref`.
+2. Link lokal ke remote dan push migrasi:
+
+   ```bash
+   supabase link --project-ref <project-ref>
+   supabase db push
+   ```
+
+3. Update env Next.js di hosting (Vercel/Netlify/CF Pages):
+
+   ```env
+   NEXT_PUBLIC_SUPABASE_URL=https://<project-ref>.supabase.co
+   NEXT_PUBLIC_SUPABASE_ANON_KEY=<anon-key-dari-dashboard>
+   ```
+
+Anon key production aman di-bundle ke frontend. Itu memang public key, RLS yang protect.
+
+## Gotcha
+
+### Lupa enable RLS
+
+```sql
+alter table notes enable row level security;
+```
+
+Tanpa baris ini, policy ditulis tapi tidak aktif. Default = open. Cara cek: di Studio, badge RLS di sebelah nama table. Atau SQL:
+
+```sql
+select relname, relrowsecurity from pg_class where relname = 'notes';
+-- relrowsecurity harus 't'
+```
+
+### service_role key bocor ke client
+
+`service_role` bypass RLS. Kalau key ini masuk ke `NEXT_PUBLIC_*` env atau di-import ke Client Component, satu user bisa lihat semua data semua user.
+
+Aturan: `service_role` cuma di server-only context (Server Action, Route Handler, server script, edge function). Tidak pernah di `NEXT_PUBLIC_*`. Tidak pernah di Client Component file.
+
+### `getSession()` vs `getUser()`
+
+`getSession()` baca JWT dari cookie tanpa verify ke auth server. Cepat tapi tidak aman untuk decision keamanan (cookie bisa di-tamper).
+
+`getUser()` kirim request ke auth server untuk verify JWT. Lambat sedikit tapi aman.
+
+Aturan: untuk decision yang penting (redirect, authorization), pakai `getUser()`. Untuk hint UI ("user kayaknya login"), `getSession()` cukup.
+
+### Middleware tidak refresh session
+
+Kalau middleware tidak ada atau tidak call `supabase.auth.getUser()`, session bisa expire silently. User klik tombol, request gagal 401, confusing.
+
+Solusi: pastikan middleware ada (Step 4) dan matcher cover semua route yang butuh auth.
+
+### RLS policy yang lupa `with check`
+
+UPDATE policy butuh dua check:
+
+- `using`: row yang dilihat (existing)
+- `with check`: row setelah update (new value)
+
+Kalau cuma `using`, user bisa update row miliknya ke `user_id` orang lain. Selalu pakai dua-duanya untuk UPDATE.
+
+### Policy banyak dan lambat
+
+RLS evaluate per row. Kalau policy kompleks dan table besar, query slow. Optimization:
+
+1. Index kolom yang dipakai di policy (`create index ... on notes(user_id)`).
+2. Bungkus function call: `(select auth.uid())` bukan `auth.uid()`.
+3. Hindari `JOIN` di dalam policy. Kalau perlu, pakai SECURITY DEFINER function.
+
+### Confirm email di production
+
+Default dev: `enable_confirmations = false`. Default production di Supabase Dashboard: `enable_confirmations = true`. User signup tapi tidak bisa login sampai klik link email.
+
+Saat deploy, set SMTP credential di Dashboard atau pakai email provider eksternal. Inbucket cuma untuk lokal.
+
+## Cost mental model
+
+Free tier Supabase:
+
+- 50,000 monthly active users (MAU)
+- 500 MB database
+- 1 GB file storage
+- 2 GB bandwidth
+- 500 MB edge function invocation
+- Project pause setelah 7 hari idle (auto-resume saat request masuk, ~5 detik delay)
+
+Dimensi yang naik bill:
+
+- **MAU**: user yang login setidaknya sekali di periode tagihan. Beyond 50K = $0.00325/MAU.
+- **DB storage**: di atas 500 MB = $0.125/GB-month.
+- **Bandwidth**: di atas 5 GB (Pro) = $0.09/GB.
+- **Edge function**: di atas 2M (Pro) = $2/M.
+- **Compute add-on**: kalau butuh DB lebih kencang, upgrade instance ($60+/month).
+
+Pro plan $25/month include 100K MAU + 8 GB DB + 250 GB transfer. Cocok mulai dari proyek serious.
+
+Mental model: untuk side project dan MVP, free tier cukup. Untuk product live di production yang tidak boleh pause, langsung Pro. Cost utama bukan storage, biasanya bandwidth + MAU.
+
+## Cross-provider
+
+| Capability | Supabase | AWS | Azure | GCP |
+|---|---|---|---|---|
+| Auth | GoTrue (email/OAuth/MFA built-in) | Cognito | Entra ID B2C | Firebase Auth / Identity Platform |
+| Data isolation | RLS (DB-enforced) | IAM + Lambda authorizer (app-enforced) | RLS di SQL DB | Firestore security rules |
+| REST endpoint | PostgREST auto-generate | API Gateway + Lambda + manual code | API Management + Function | API Gateway + Cloud Run |
+| Setup effort | 1 migration + 1 env | 3-4 service + IAM + boilerplate | 3-4 service | 3-4 service |
+
+Posisi Supabase: low-friction untuk B2C app yang fit ke pola "user own data". Untuk multi-tenant B2B dengan logic role kompleks (admin/manager/staff per organisasi), RLS bisa, tapi policy makin kompleks. Di titik itu, pertimbangkan kombinasi RLS + view + SECURITY DEFINER function, atau pisah logic ke Edge Function.
+
+AWS untuk skenario yang sama butuh setup signifikan lebih (Cognito + API GW + Lambda + DynamoDB + IAM), tapi lebih fleksibel untuk kasus enterprise yang non-standard.
+
+## Anti-pattern
+
+- Filter `where user_id = ?` di app code padahal RLS sudah aktif. Duplikasi logic, mudah inkonsisten saat policy diubah.
+- `service_role` key di Client Component atau `NEXT_PUBLIC_*` env. Bocor = semua data semua user terbuka.
+- Tidak `alter table ... enable row level security`. Policy ada tapi inactive, data terbuka.
+- Test RLS via `psql` sebagai `postgres` user. Itu bypass RLS, hasilnya nipu.
+- Cek session dengan `getSession()` lalu redirect berdasarkan itu. Cookie bisa di-tamper, pakai `getUser()`.
+- Auth flow nested di middleware kompleks. Supabase SSR pattern minimal: middleware refresh session, halaman call `getUser()` lagi untuk authorization. Don't overengineer.
+
+## Setelah ini
+
+- Next journey: **S2 File upload via Storage** (signed URL, image transform), work in progress.
+- Service deep page: **Auth**, **Database**, dan **Postgres + RLS pattern**, work in progress.
+- Mau tweak local stack lebih lanjut: [Local Stack](/id/supabase/tools/local-stack).

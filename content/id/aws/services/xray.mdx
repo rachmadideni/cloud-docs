@@ -1,0 +1,132 @@
+# X-Ray
+
+**TL;DR**: Distributed tracing service AWS. Trace request flow lewat multiple service (API GW -> Lambda -> DynamoDB -> SQS -> Lambda lain). Service map visual, latency breakdown per segment. Sampling default 1 req/detik + 5% rest untuk hemat cost.
+
+## Analogi
+
+GPS untuk request. Tahu request lewat jalan mana, berhenti di mana, berapa lama tiap perhentian. Tanpa tracing, debug latency = tebak-tebakan.
+
+## Kapan pakai
+
+- ✅ Microservice arsitektur, debug latency cross-service.
+- ✅ Identify bottleneck (apa request lambat di Lambda atau DynamoDB query).
+- ✅ Visualisasi service dependency graph.
+- ✅ Error rate per service segment.
+- ✅ Lambda dengan banyak downstream call (DynamoDB, S3, API external).
+
+## Kapan jangan
+
+- ❌ Single Lambda tanpa downstream. Overkill, CloudWatch Logs cukup.
+- ❌ Real-time alerting. Trace eventual, alert pakai CloudWatch Alarm.
+- ❌ Full APM (deep code profiling). Pakai Datadog APM, New Relic, Dynatrace.
+- ❌ Vendor lock-in concern. Pakai OpenTelemetry SDK, exporter ke X-Ray atau Jaeger atau Tempo (bisa swap).
+
+## Pricing mental model
+
+| Komponen | Harga |
+|---|---|
+| Trace recorded | $5 per 1 juta |
+| Trace retrieved | $0.50 per 1 juta |
+| Trace scanned (Insights) | $0.50 per 1 juta |
+| Free tier permanen | 100k trace recorded/bulan + 1M retrieved |
+
+Default sampling: 1 req/detik + 5% of rest. Untuk traffic tinggi, jarang trace full 100%. Tweak per service kalau perlu deeper analysis.
+
+## Local emulator
+
+**Floci status**: ❌ gap
+
+Fallback: **Jaeger** lokal via Docker. Instrument app pakai OpenTelemetry SDK (vendor-neutral), exporter ke Jaeger di lokal, swap ke X-Ray di produksi dengan ganti exporter.
+
+```yaml
+# docker-compose.yml
+jaeger:
+  image: jaegertracing/all-in-one:latest
+  ports:
+    - '16686:16686'   # UI
+    - '4317:4317'     # OTLP gRPC
+    - '4318:4318'     # OTLP HTTP
+  environment:
+    COLLECTOR_OTLP_ENABLED: 'true'
+```
+
+Akses UI: `http://localhost:16686`.
+
+## Hello-world
+
+### Enable di Lambda
+
+```bash
+aws lambda update-function-configuration \
+  --function-name my-fn \
+  --tracing-config Mode=Active
+
+aws iam attach-role-policy --role-name lambda-role \
+  --policy-arn arn:aws:iam::aws:policy/AWSXRayDaemonWriteAccess
+```
+
+Lambda auto-emit segment ke X-Ray, tanpa code change.
+
+### Manual segment dengan OpenTelemetry
+
+```js
+const { trace } = require('@opentelemetry/api')
+const tracer = trace.getTracer('my-app')
+
+exports.handler = async (event) => {
+  return await tracer.startActiveSpan('handler', async (span) => {
+    span.setAttribute('http.path', event.path)
+    try {
+      const data = await fetchFromDB()
+      return ok(200, data)
+    } catch (err) {
+      span.recordException(err)
+      span.setStatus({ code: 2, message: err.message })
+      throw err
+    } finally {
+      span.end()
+    }
+  })
+}
+
+async function fetchFromDB() {
+  return await tracer.startActiveSpan('dynamodb.query', async (s) => {
+    s.setAttributes({ 'db.system': 'dynamodb', 'db.operation': 'Query' })
+    const res = await ddb.send(...)
+    s.end()
+    return res
+  })
+}
+```
+
+### Service map
+
+Buka X-Ray console -> Service Map. Visualisasi node per service, edge per call. Click node untuk lihat metric per segment.
+
+## Gotcha
+
+- **Sampling default tidak 100%**: 1 req/detik + 5%. Untuk traffic tinggi sampling jauh di bawah 100%. Issue jarang bisa miss. Tweak sampling rule per endpoint critical.
+- **Trace correlation butuh header propagation**: `X-Amzn-Trace-Id` antar service AWS, `traceparent` (W3C) untuk OpenTelemetry. Tanpa propagate, segment terpisah-pisah.
+- **X-Ray vs OpenTelemetry**: X-Ray SDK lock-in. OTel SDK vendor-neutral, exporter ke X-Ray. Prefer OTel untuk fleksibilitas swap tool.
+- **CloudWatch ServiceLens**: gabungan CloudWatch + X-Ray. Service map dengan metric overlay (latency, error rate, throughput). Built-in.
+- **Trace retention 30 hari**: setelah itu hilang. Untuk archive, export ke S3 via Lambda subscriber.
+- **API Gateway active tracing per stage**: enable di stage settings, bukan global API.
+- **X-Ray Insights mengonsumsi trace**: enable Insights = auto-analyze trace untuk anomaly. Cost scan tambahan.
+- **Manual subsegment overhead**: setiap span tambah memory + CPU sedikit. Untuk hot path, batch atau filter span.
+- **Lambda function URL tidak support active tracing built-in**: harus pakai SDK manual untuk emit segment.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Application Insights | broader APM |
+| GCP | Cloud Trace | mirip X-Ray |
+| Self-hosted | Jaeger, Tempo, Zipkin | open source |
+| Third-party | Datadog APM, Honeycomb | deeper insights, mahal |
+| Vendor-neutral | OpenTelemetry | SDK + collector untuk emit ke banyak backend |
+
+## Belajar lebih lanjut
+
+- Pakai X-Ray di journey: [J10 Observability](/id/aws/journeys/j10-observability).
+- [AWS X-Ray docs](https://docs.aws.amazon.com/xray/).
+- [OpenTelemetry docs](https://opentelemetry.io/docs/).

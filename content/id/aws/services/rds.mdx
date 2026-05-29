@@ -1,0 +1,141 @@
+# RDS (Relational Database Service)
+
+**TL;DR**: Managed Postgres/MySQL/MariaDB/Oracle/SQL Server. AWS handle backup, patch, replica, failover. Kamu fokus schema dan query. Multi-AZ untuk high availability, read replica untuk skala baca.
+
+## Analogi
+
+DBA outsource. Database tetap database (SQL, schema, query), tapi tidak ada server fisik yang harus kamu install OS, install Postgres, atau patch security.
+
+## Kapan pakai
+
+- ✅ App dengan banyak JOIN dan relasi antar entity.
+- ✅ Transactional integrity multi-table (ACID).
+- ✅ Reporting dan analytics dengan SQL kompleks.
+- ✅ Migrate aplikasi legacy yang sudah pakai relational DB.
+- ✅ Stable schema dengan FK constraint.
+
+## Kapan jangan
+
+- ❌ Workload key-value lookup high-throughput. DynamoDB lebih cocok dan murah.
+- ❌ Time-series data volume tinggi. Timestream, InfluxDB, atau TimescaleDB.
+- ❌ Aplikasi serverless yang scale dari 0 ke ribuan. Connection storm. Aurora Serverless v2 atau pakai RDS Proxy.
+- ❌ Schema very dynamic (tambah kolom tiap minggu). NoSQL.
+- ❌ Data lake / analytic warehouse petabyte. Redshift atau S3 + Athena.
+
+## Engine pilihan
+
+| Engine | Use case |
+|---|---|
+| **Postgres** | default modern, ekosistem extension kaya (pgvector, PostGIS) |
+| **MySQL** | legacy app, tooling matang |
+| **MariaDB** | drop-in MySQL alternative |
+| **Oracle** | enterprise legacy, lisensi mahal |
+| **SQL Server** | .NET workload |
+| **Aurora (Postgres/MySQL flavor)** | AWS-native, throughput 3-5x lebih cepat, failover sub-minute, mahal ~20% |
+
+## Pricing mental model
+
+| Komponen | Harga (us-east-1) |
+|---|---|
+| Instance hour | $0.017/jam (db.t4g.micro) sampai puluhan dolar/jam (db.x2g.16xlarge) |
+| Multi-AZ | 2x instance cost (standby di AZ lain) |
+| Storage gp3 | $0.115/GB/bulan |
+| Storage IO (io2) | lebih mahal, untuk DB high-IOPS |
+| Backup | gratis sampai size DB, di luar itu $0.095/GB/bulan |
+| Snapshot export ke S3 | $0.010/GB |
+| Data transfer cross-AZ | $0.01/GB (Multi-AZ replication dimasukkan) |
+
+Contoh: db.t4g.micro Multi-AZ + 20 GB storage = ~$25/bulan.
+
+## Local emulator
+
+**Floci status**: ✅ full (Postgres, MySQL, MariaDB), Floci-exclusive vs LocalStack Free
+
+Floci spawn container Postgres beneran. Connection via standard pg client.
+
+```bash
+awsl rds create-db-instance \
+  --db-instance-identifier mydb \
+  --db-instance-class db.t3.micro \
+  --engine postgres \
+  --master-username postgres \
+  --master-user-password 'Passw0rd!' \
+  --allocated-storage 20 \
+  --db-name myapp
+
+# Dapatkan endpoint
+ENDPOINT=$(awsl rds describe-db-instances \
+  --db-instance-identifier mydb \
+  --query 'DBInstances[0].Endpoint.Address' --output text)
+
+PGPASSWORD='Passw0rd!' psql -h $ENDPOINT -U postgres -d myapp
+```
+
+## Hello-world
+
+```sql
+-- di psql session
+CREATE TABLE users (
+  id SERIAL PRIMARY KEY,
+  email TEXT UNIQUE NOT NULL,
+  created_at TIMESTAMP DEFAULT NOW()
+);
+
+INSERT INTO users (email) VALUES ('alice@example.com');
+SELECT * FROM users;
+```
+
+Dari Lambda dengan pg pool:
+
+```js
+const { Pool } = require('pg')
+let pool
+
+async function getPool() {
+  if (pool) return pool
+  pool = new Pool({
+    host: process.env.DB_HOST,
+    user: process.env.DB_USER,
+    password: process.env.DB_PASS,
+    database: process.env.DB_NAME,
+    max: 5,
+    idleTimeoutMillis: 30000
+  })
+  return pool
+}
+
+exports.handler = async () => {
+  const db = await getPool()
+  const { rows } = await db.query('SELECT NOW()')
+  return { statusCode: 200, body: JSON.stringify(rows) }
+}
+```
+
+Pool di module scope, lazy init. Lihat [J6 Relational App](/id/aws/journeys/j6-relational) untuk pattern lengkap.
+
+## Gotcha
+
+- **Hidup di VPC**: RDS tidak punya public endpoint by default (good). Lambda harus di VPC sama untuk akses. Laptop akses via bastion EC2 atau SSM Session Manager.
+- **Connection storm**: Lambda concurrency tinggi exhaust max_connections Postgres (default 100). Pakai RDS Proxy.
+- **Multi-AZ tidak read replica**: standby Multi-AZ untuk failover, tidak terima query. Untuk skala baca, bikin read replica terpisah.
+- **Aurora vs RDS Postgres**: Aurora 3-5x throughput, failover di bawah 60 detik, backup tanpa pause. Lebih mahal ~20%, butuh engine `aurora-postgresql`.
+- **Parameter group default read-only**: ubah `max_connections` atau setting lain butuh bikin custom parameter group, attach, reboot instance.
+- **Major version upgrade non-trivial**: PG 14 ke 15 bisa break extension atau syntax. Test di staging dulu.
+- **Storage auto-grow tidak boleh shrink**: storage cuma bisa naik, tidak bisa turun. Salah size = bayar storage lebih besar selamanya (atau migrate ke instance baru).
+- **Snapshot export bukan backup proper**: snapshot tetap di AWS (region lock). Untuk DR proper, export snapshot ke S3 cross-region.
+- **Long-running query bisa di-killed otomatis**: ada `statement_timeout` parameter. Default tidak set, tapi query yang lama tidak bagus untuk pool.
+- **Performance Insights mahal di high-throughput**: $0.10 per vCPU/jam aktif. Hemat dengan disable di non-prod.
+
+## Cross-provider
+
+| Provider | Service | Catatan |
+|---|---|---|
+| Azure | Database for Postgres/MySQL/MariaDB | Single Server (legacy) vs Flexible Server (recommended) |
+| GCP | Cloud SQL | Postgres/MySQL/SQL Server |
+| Oracle | Autonomous Database | self-tuning, premium feature |
+| Self-hosted | Postgres on EC2 | full control, full ops burden |
+
+## Belajar lebih lanjut
+
+- Pakai RDS di journey: [J6 Relational App](/id/aws/journeys/j6-relational).
+- [AWS RDS docs](https://docs.aws.amazon.com/rds/).

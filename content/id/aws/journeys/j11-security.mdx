@@ -1,0 +1,361 @@
+# J11: Security Baseline
+
+**TL;DR**: Akun AWS fresh punya banyak default yang tidak aman untuk produksi. Pasang baseline: MFA root, encryption everywhere (KMS), secret di Secrets Manager (bukan env var), audit log via CloudTrail, threat detection via GuardDuty. Floci handle IAM/KMS/Secrets/CloudTrail. GuardDuty/Inspector/Macie konseptual only di lokal.
+
+Waktu estimasi: 40 menit.
+
+## Apa yang kita kerjakan
+
+Bukan build aplikasi baru. Audit + hardening akun AWS untuk siap produksi. Checklist berbasis [AWS Foundational Security Best Practices](https://docs.aws.amazon.com/securityhub/latest/userguide/fsbp-standard.html).
+
+Setelah selesai, kamu punya checklist 12 item yang harus tercentang sebelum aplikasi di produksi serius.
+
+## Tiga lapis defense
+
+| Lapis | Tujuan | Service |
+|---|---|---|
+| **Identity** | siapa boleh akses apa | IAM, SCP, MFA |
+| **Data** | data terenkripsi di transit dan at-rest | KMS, ACM, Secrets Manager |
+| **Detection** | tahu kalau ada serangan atau anomali | CloudTrail, GuardDuty, Config, Inspector |
+
+Plus prevention layer kalau pakai Organizations: SCP block destructive action di akun child.
+
+## Floci coverage
+
+| Service | Status | Catatan |
+|---|---|---|
+| IAM | ✅ full | dari [J3](/id/aws/foundation/iam) |
+| KMS | ✅ full | sign + verify + encrypt + decrypt |
+| Secrets Manager | ✅ full | rotation config bisa dibuat |
+| CloudTrail | ⚠️ partial | trail bisa di-create, event delivery tidak 1:1 |
+| GuardDuty | ❌ gap | dokumen konseptual only |
+| Inspector | ❌ gap | dokumen konseptual only |
+| Macie | ❌ gap | dokumen konseptual only |
+| AWS Config | ⚠️ partial | rules bisa di-define, evaluation terbatas |
+
+Untuk Floci gap, baca section "Konsep" tanpa hands-on. Test full di staging account AWS asli.
+
+## Setup lokal
+
+```bash
+mkdir j11-security && cd j11-security
+```
+
+```yaml
+# docker-compose.yml
+services:
+  floci:
+    image: floci/floci:latest
+    ports: ['4566:4566']
+    volumes:
+      - /var/run/docker.sock:/var/run/docker.sock
+```
+
+```bash
+docker compose up -d
+alias awsl='aws --endpoint-url=http://localhost:4566'
+```
+
+## Step build / checklist
+
+### 1. Root account locked down
+
+Root user adalah email yang sign up akun. Akses tidak boleh dipakai harian.
+
+Hari pertama akun baru:
+1. Set strong password unique (password manager).
+2. Enable MFA (hardware key seperti YubiKey lebih aman dari SMS).
+3. Delete access key root kalau ada (gunakan IAM user untuk programmatic access).
+4. Set billing alarm $5 (atau threshold project).
+5. Simpan credential root di brankas atau password manager team.
+6. Lupakan root account, jangan login lagi kecuali butuh action root-only (close account, ubah billing).
+
+Di Floci tidak ada konsep root account. Step ini cuma checklist untuk AWS asli.
+
+### 2. IAM user untuk diri sendiri (bukan root)
+
+```bash
+# Bikin admin user
+awsl iam create-user --user-name alice-admin
+
+# Attach AdministratorAccess
+awsl iam attach-user-policy \
+  --user-name alice-admin \
+  --policy-arn arn:aws:iam::aws:policy/AdministratorAccess
+
+# Bikin access key (untuk CLI)
+awsl iam create-access-key --user-name alice-admin
+
+# Atau enable console password
+awsl iam create-login-profile --user-name alice-admin \
+  --password 'TempPassw0rd!' --password-reset-required
+```
+
+Production: enable MFA untuk semua admin user, pakai SSO (AWS IAM Identity Center) kalau team lebih dari 5 orang. Hindari long-term access key, prefer temporary credential via SSO atau AssumeRole.
+
+### 3. Password policy
+
+```bash
+awsl iam update-account-password-policy \
+  --minimum-password-length 14 \
+  --require-symbols --require-numbers \
+  --require-uppercase-characters --require-lowercase-characters \
+  --max-password-age 90 \
+  --password-reuse-prevention 5
+```
+
+14 character minimum lebih kuat dari rekomendasi lama 8. Tetap manageable dengan password manager.
+
+### 4. KMS key untuk data encryption
+
+Customer managed key (CMK) memberi kontrol lebih dari AWS-managed key.
+
+```bash
+KEY_ID=$(awsl kms create-key \
+  --description "App master encryption key" \
+  --query 'KeyMetadata.KeyId' --output text)
+
+# Alias supaya readable
+awsl kms create-alias \
+  --alias-name alias/app-master \
+  --target-key-id $KEY_ID
+
+# Enable rotation tahunan
+awsl kms enable-key-rotation --key-id $KEY_ID
+```
+
+Pakai key ini untuk encrypt:
+- S3 bucket (`--sse-c aws:kms --sse-kms-key-id alias/app-master`).
+- EBS volume (`--encrypted --kms-key-id`).
+- RDS (`--storage-encrypted --kms-key-id`).
+- DynamoDB (`--sse-specification Enabled=true,KMSMasterKeyId=alias/app-master`).
+- Secrets Manager (`--kms-key-id`).
+
+Key rotation tahunan berarti AWS generate key material baru tiap tahun, simpan history versi lama untuk decrypt data lama.
+
+### 5. Secrets Manager untuk credential
+
+Anti-pattern: hardcode password di env var, atau commit ke git.
+
+```bash
+awsl secretsmanager create-secret \
+  --name app/prod/db-password \
+  --secret-string '{"username":"app","password":"strong-random-password"}' \
+  --kms-key-id alias/app-master
+```
+
+Lambda fetch saat runtime:
+
+```js
+const { SecretsManagerClient, GetSecretValueCommand } =
+  require('@aws-sdk/client-secrets-manager')
+
+const sm = new SecretsManagerClient()
+let cachedSecret = null
+
+async function getDbCreds() {
+  if (cachedSecret) return cachedSecret
+  const res = await sm.send(new GetSecretValueCommand({
+    SecretId: 'app/prod/db-password'
+  }))
+  cachedSecret = JSON.parse(res.SecretString)
+  return cachedSecret
+}
+```
+
+Cache di module scope untuk hindari panggil Secrets Manager tiap invocation. Cost $0.05/10000 API call cepat naik di Lambda traffic tinggi.
+
+**Auto-rotation untuk RDS**:
+
+```bash
+awsl secretsmanager rotate-secret \
+  --secret-id app/prod/db-password \
+  --rotation-lambda-arn arn:aws:lambda:us-east-1:000000000000:function:SecretsManagerRDSRotation \
+  --rotation-rules AutomaticallyAfterDays=30
+```
+
+Lambda yang AWS provide handle rotation: bikin password baru, update RDS, update secret value, test koneksi. Tanpa downtime karena RDS support dual password sementara.
+
+### 6. CloudTrail account-wide
+
+Audit log semua API call di akun. Wajib untuk forensic dan compliance.
+
+```bash
+# Bucket untuk trail logs
+awsl s3 mb s3://my-cloudtrail-logs-prod
+
+# Bucket policy untuk allow CloudTrail write
+awsl s3api put-bucket-policy --bucket my-cloudtrail-logs-prod \
+  --policy '{"Version":"2012-10-17","Statement":[{"Sid":"AWSCloudTrailAclCheck","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":"s3:GetBucketAcl","Resource":"arn:aws:s3:::my-cloudtrail-logs-prod"},{"Sid":"AWSCloudTrailWrite","Effect":"Allow","Principal":{"Service":"cloudtrail.amazonaws.com"},"Action":"s3:PutObject","Resource":"arn:aws:s3:::my-cloudtrail-logs-prod/AWSLogs/000000000000/*"}]}'
+
+# Create trail
+awsl cloudtrail create-trail \
+  --name org-trail \
+  --s3-bucket-name my-cloudtrail-logs-prod \
+  --is-multi-region-trail \
+  --enable-log-file-validation
+
+awsl cloudtrail start-logging --name org-trail
+```
+
+`--is-multi-region-trail`: capture event di semua region (penting kalau attacker spin resource di region kamu tidak pakai).
+`--enable-log-file-validation`: bikin checksum digest. Tahu kalau log file di-tamper.
+
+Production: enable juga **CloudTrail Lake** untuk SQL-query log lebih ergonomic dari S3 + Athena.
+
+### 7. AWS Config untuk compliance check
+
+Config evaluate resource secara terus-menerus melawan rule. Contoh rule:
+- `s3-bucket-public-read-prohibited`: S3 bucket tidak boleh public read.
+- `encrypted-volumes`: semua EBS harus encrypted.
+- `iam-user-mfa-enabled`: IAM user dengan password harus MFA.
+
+```bash
+awsl configservice put-config-rule --config-rule '{
+  "ConfigRuleName": "s3-bucket-public-read-prohibited",
+  "Source": {
+    "Owner": "AWS",
+    "SourceIdentifier": "S3_BUCKET_PUBLIC_READ_PROHIBITED"
+  }
+}'
+```
+
+Resource yang violate rule muncul di Config dashboard sebagai non-compliant. Set Auto-Remediation untuk auto-fix (mis. Lambda yang auto-block public access).
+
+### 8. GuardDuty (konsep, gap di Floci)
+
+GuardDuty adalah threat detection managed. Analyze:
+- CloudTrail event (anomali API call)
+- VPC Flow Logs (traffic mencurigakan)
+- DNS query (komunikasi ke C2 server)
+- S3 data event (bulk download tidak normal)
+- EKS audit log (compromise pod)
+
+Output: finding dengan severity (Low/Medium/High). Sample finding:
+- `UnauthorizedAccess:IAMUser/InstanceCredentialExfiltration`: credential EC2 instance dipakai dari IP luar akun.
+- `CryptoCurrency:EC2/BitcoinTool.B`: EC2 instance kontak DNS pool mining.
+- `Persistence:IAMUser/AnomalousBehavior`: user bikin access key baru di luar pola normal.
+
+Enable:
+
+```bash
+aws guardduty create-detector --enable
+```
+
+Cost: ~$0.0004 per CloudTrail event analyzed. Untuk akun small bisa $5-30/bulan. Worth karena 1 incident security cost-nya jauh lebih besar.
+
+Integrate ke SOC pipeline via EventBridge: setiap finding HIGH otomatis fire alert ke Slack/PagerDuty.
+
+### 9. Inspector (konsep, gap di Floci)
+
+Scan vulnerability di:
+- EC2 instance: scan paket OS yang punya CVE.
+- ECR container image: scan layer image untuk CVE.
+- Lambda function: scan layer dan dependency npm/pip.
+
+Enable:
+
+```bash
+aws inspector2 enable --resource-types EC2 ECR LAMBDA
+```
+
+Finding: list CVE + severity + remediation step. Misal "package openssl 1.1.1k punya CVE-2024-xxx, upgrade ke 1.1.1m".
+
+Cost: per scan. ECR image scan $0.09 per scan. Lambda layer scan $0.30 per scan per bulan. EC2 ~$1.25 per instance per bulan.
+
+### 10. Macie (konsep, gap di Floci)
+
+Scan S3 bucket untuk PII (KTP number, credit card, email, dll). Detect sensitive data yang accidentally publik atau di bucket yang seharusnya tidak menyimpan PII.
+
+Enable:
+
+```bash
+aws macie2 enable-macie
+```
+
+Cost: per data dipindai. $1.25/GB. Mahal untuk bucket besar. Strategi: scan periodic, atau cuma bucket spesifik dengan tag `sensitive=true`.
+
+### 11. Service Control Policy (kalau pakai Organizations)
+
+SCP block action di level Organization. Bahkan root user akun child tidak bisa bypass.
+
+Sample SCP: block penghapusan CloudTrail.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [{
+    "Effect": "Deny",
+    "Action": ["cloudtrail:StopLogging", "cloudtrail:DeleteTrail"],
+    "Resource": "*"
+  }]
+}
+```
+
+Attach SCP ke OU. Semua akun di OU itu tidak bisa stop CloudTrail, walau IAM policy allow.
+
+Sample policy lain:
+- Deny `iam:CreateUser` (force pakai SSO).
+- Deny resource creation di region yang tidak approved.
+- Deny `kms:DisableKey` untuk key production.
+
+### 12. Audit checklist final
+
+- [ ] Root MFA enabled, access key deleted
+- [ ] IAM user pakai SSO atau MFA
+- [ ] Password policy aktif (14+ char, rotation 90 hari)
+- [ ] CMK aktif untuk data encryption (S3, EBS, RDS, Secrets)
+- [ ] Tidak ada hardcoded secret di code (audit via `git secrets` atau Gitleaks)
+- [ ] Semua secret di Secrets Manager, rotation aktif untuk RDS
+- [ ] CloudTrail multi-region enabled, log file validation aktif
+- [ ] AWS Config aktif dengan minimal 10 rule baseline
+- [ ] GuardDuty aktif di semua region
+- [ ] Inspector aktif untuk EC2/ECR/Lambda
+- [ ] CloudTrail trails dilindungi SCP dari delete (kalau Organizations)
+- [ ] Budget alert aktif
+
+## Gotcha
+
+- **CloudTrail log delete-able sebelum SCP attached**: attacker dengan akses admin bisa hapus trail untuk hide jejak. Lindungi dengan SCP plus S3 Object Lock di bucket trail.
+- **GuardDuty per region**: aktifkan di semua region (termasuk yang tidak dipakai), karena attacker bisa spin resource di region kosong.
+- **Inspector deep scan butuh agent**: untuk EC2, install SSM Agent (biasanya pre-installed di AMI Amazon Linux). Tanpa agent, cuma surface scan.
+- **KMS key dihapus = data hilang**: KMS key delete punya 7-30 hari pending period. Setelah delete, data yang di-encrypt key itu tidak bisa di-decrypt. Audit sebelum delete.
+- **Secrets Manager rotation Lambda butuh VPC akses RDS**: kalau RDS di private subnet, Lambda rotation harus di VPC sama dengan akses ke RDS plus internet (untuk panggil Secrets Manager API).
+- **Cost Macie mahal untuk historical scan**: scan 1 TB = $1250. Pakai sampling job dulu untuk discover bucket sensitive, baru full scan target tertentu.
+- **GuardDuty finding noise**: minggu pertama banyak false positive (SSH dari ISP rumah dianggap mencurigakan). Tuning rules, suppress finding spesifik via filter.
+- **CloudTrail data event mahal**: management event gratis. Data event (S3 GetObject, Lambda Invoke, dll) $0.10 per 100k. Untuk audit lengkap S3 access bisa $1000+/bulan di traffic tinggi. Selective enable per bucket sensitive.
+- **Config rule evaluation terbatas**: tidak semua resource type dievaluasi continuous. Beberapa cuma evaluate saat resource berubah. Cek dokumentasi per rule.
+- **SCP tidak block service-linked role**: SCP cuma block principal yang di-call manually. Service-linked role (mis. yang auto-bikin oleh ECS) bypass.
+
+## Cost (AWS asli)
+
+Untuk akun produksi ukuran kecil-menengah:
+
+- IAM: gratis (unless pakai SSO multi-account, license)
+- KMS: $1/key/bulan + $0.03/10k request. CMK aktif ~$1-5/bulan.
+- Secrets Manager: $0.40/secret/bulan + $0.05/10k API call. 10 secret = $4/bulan.
+- CloudTrail: management event gratis, data event variabel.
+- AWS Config: $0.003/configuration item + $0.001/rule evaluation. ~$10-30/bulan untuk akun small.
+- GuardDuty: ~$0.0004/CloudTrail event + per VPC flow log GB + DNS query. **$15-50/bulan typical**.
+- Inspector: per scan ($0.09 ECR image, $0.30 Lambda, $1.25 EC2/bulan). Variabel.
+- Macie: $1.25/GB scanned. Bisa $0 (tidak aktif) atau ribuan dolar di bucket besar.
+
+Total baseline security: **sekitar $50-100/bulan** untuk akun produksi kecil. Naik dengan ukuran data dan resource.
+
+Worth setiap rupiah. Cost dari satu data breach atau crypto-mining hijack di EC2 jauh lebih besar.
+
+## Cleanup
+
+```bash
+docker compose down -v
+```
+
+AWS asli: **hati-hati delete security resource**. Sebelum delete, pastikan tidak ada workload production yang depend. Cek SCP impact dulu.
+
+## Next step
+
+- Mau central security view multi-account? Setup AWS Security Hub, aggregate finding GuardDuty + Inspector + Config + custom finding ke single dashboard.
+- Mau compliance report (SOC 2, PCI-DSS, HIPAA)? Audit Manager bantu generate evidence. Mahal tapi save berbulan-bulan kerja manual.
+- Mau pen-test akun sendiri? Pakai tool seperti **Pacu** (CloudGoat scenario) atau **ScoutSuite** untuk vulnerability scan.
+- Mau policy-as-code? Cloud Custodian, Terrascan, atau cfn-nag scan template Terraform/CloudFormation sebelum deploy.
+- Mau zero-trust internal network? VPC Lattice atau App Mesh dengan mTLS, ABAC policy berbasis attribute.

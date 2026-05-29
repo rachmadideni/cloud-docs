@@ -1,0 +1,37 @@
+# AWS
+
+Dokumentasi AWS terbungkus journey use-case nyata, plus deep page per service. Local-first lewat [floci.io](https://floci.io) emulator.
+
+## Mulai dari mana?
+
+- Baru kenal cloud atau AWS? Mulai dari [Fondasi](/id/aws/foundation).
+- Mau bikin sesuatu konkret? Buka [Use-Case Journey](/id/aws/journeys).
+- Cari service spesifik? Cek [Service Reference](/id/aws/services).
+- Setup emulator dan tooling? Lihat [Tools & Emulator](/id/aws/tools).
+
+## 12 Use-Case Journey
+
+| ID | Journey | Service utama |
+|---|---|---|
+| [J1](/id/aws/journeys/j1-static-site) | Static site + custom domain | S3, CloudFront, Route53, ACM |
+| [J2](/id/aws/journeys/j2-rest-api) | REST API serverless | Lambda, API Gateway, DynamoDB, IAM |
+| [J3](/id/aws/journeys/j3-auth) | Auth & user management | Cognito, IAM, Secrets Manager |
+| [J4](/id/aws/journeys/j4-file-upload) | File upload pipeline | S3 presigned, Lambda, SQS, Rekognition |
+| [J5](/id/aws/journeys/j5-event-driven) | Event-driven backend | EventBridge, SQS, SNS, Step Functions |
+| [J6](/id/aws/journeys/j6-relational) | Relational app | RDS Postgres, RDS Proxy, VPC |
+| [J7](/id/aws/journeys/j7-data-pipeline) | Data pipeline / analytics | Kinesis, Firehose, Glue, Athena |
+| [J8](/id/aws/journeys/j8-container) | Container workload | ECR, ECS Fargate, ALB |
+| [J9](/id/aws/journeys/j9-kubernetes) | Kubernetes | EKS, ALB Controller, IRSA |
+| [J10](/id/aws/journeys/j10-observability) | Observability | CloudWatch, X-Ray, OpenSearch |
+| [J11](/id/aws/journeys/j11-security) | Security baseline | IAM, SCP, GuardDuty, KMS |
+| [J12](/id/aws/journeys/j12-ai-ml) | AI/ML inference | Bedrock, SageMaker, S3 |
+
+## Service Reference
+
+30+ service deep page. Tiap halaman ikut template: TL;DR, analogi, perfect use-case, anti use-case, pricing mental model, local emulator status, hello-world, gotcha, cross-provider.
+
+Lihat [Service Reference](/id/aws/services) untuk daftar lengkap.
+
+## Local Emulator
+
+Default pakai [floci.io](https://floci.io): single endpoint `localhost:4566`, 45 service AWS, MIT, free total. Coverage gap (CloudFront, X-Ray, Rekognition, GuardDuty, Bedrock) ada fallback di [Tools & Emulator](/id/aws/tools).
