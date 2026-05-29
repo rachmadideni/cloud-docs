@@ -1,4 +1,5 @@
 export default {
   index: 'Overview',
-  database: 'Database (Postgres)'
+  database: 'Database (Postgres)',
+  auth: 'Auth (GoTrue)'
 }

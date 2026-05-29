@@ -1,0 +1,517 @@
+# Auth (GoTrue)
+
+**TL;DR**: Managed authentication server di balik endpoint `/auth/v1`. Handle signup, signin, password reset, OAuth provider, MFA, dan magic link. User disimpan di schema `auth.users` Postgres, foreign key langsung dari tabel aplikasi. JWT yang di-issue di-baca RLS lewat `auth.uid()`.
+
+**Analogi**: AWS Cognito atau Firebase Auth, dengan dua perbedaan struktural: (1) user table ada di Postgres yang sama dengan data aplikasi (bukan terpisah seperti Cognito), (2) RLS jadi mekanisme isolasi default, bukan IAM authorizer terpisah.
+
+## Perfect use-case
+
+- Aplikasi B2C dengan signup standard (email/password, social login, magic link)
+- Foreign key direct `references auth.users(id)` di tabel aplikasi, RLS pakai `auth.uid()`
+- MFA opsional untuk akun penting (TOTP, SMS, WhatsApp)
+- Anonymous sign-in untuk app yang butuh "guest mode" dengan migrate ke akun penuh nanti
+- Server-rendered app dengan cookie-based session via `@supabase/ssr`
+- Custom claim di JWT untuk RBAC tanpa query DB per request
+
+## Anti use-case
+
+- Enterprise SSO dengan custom SAML IdP yang kompleks. Bisa, tapi lebih rendah friction pakai Entra ID atau Okta yang spesialis di sini.
+- Konsumsi sebagai pure auth backend tanpa pakai Postgres+RLS Supabase. Bisa secara teknis, tapi separation menghilangkan keuntungan integrasi yang jadi value-prop utama.
+- Per-user permission yang super-granular (per-resource ACL dengan 1000+ permission unik). Pakai sistem AuthZ dedicated (Oso, Cerbos, OpenFGA) di atas Supabase Auth.
+- Anonymous + permanent user co-exist permanen di table yang sama. Bikin RLS policy lebih kompleks karena anonymous user juga punya `auth.uid()`.
+
+## Pricing mental model
+
+| Dimensi | Free | Pro $25/mo | Beyond |
+|---|---|---|---|
+| Monthly Active Users (MAU) | 50,000 | 100,000 included | $0.00325/MAU |
+| SMS untuk OTP/MFA | tidak include | tidak include | provider eksternal (Twilio dll), self-managed |
+| Email | bundled (Inbucket lokal, simple SMTP prod) | sama | custom SMTP dianjurkan production |
+| OAuth provider | unlimited | unlimited | unlimited |
+| MFA factor | unlimited | unlimited | unlimited |
+
+MAU dihitung user yang login (ada session aktif atau auth call) setidaknya sekali di periode tagihan. User yang signup tapi tidak pernah login lagi tidak dihitung di periode berikutnya. Free tier 50K MAU jauh dari typical MVP.
+
+Cost yang sering miss: **SMS**. Phone OTP atau SMS MFA jalan via provider eksternal (Twilio default). Tagihan terpisah dari Supabase. 1000 SMS internasional bisa $20-50 tergantung region.
+
+## Local emulator
+
+Auth jalan di balik Kong port 54321. Endpoint:
+
+```
+http://127.0.0.1:54321/auth/v1
+```
+
+Default email confirmation off di lokal (`config.toml [auth.email] enable_confirmations = false`), signup langsung confirmed. Email yang dikirim (magic link, reset password) di-catch [Inbucket/Mailpit](/id/supabase/tools/local-stack#inbucket-vs-mailpit) di port 54324.
+
+Tweak config di `supabase/config.toml`:
+
+```toml
+[auth]
+site_url = "http://localhost:3000"
+additional_redirect_urls = ["http://localhost:3000/auth/callback"]
+jwt_expiry = 3600
+enable_signup = true
+enable_anonymous_sign_ins = false
+
+[auth.email]
+enable_signup = true
+enable_confirmations = false  # production: true
+double_confirm_changes = true
+otp_length = 6
+otp_expiry = 3600
+
+[auth.sms]
+enable_signup = false
+
+[auth.external.google]
+enabled = false
+client_id = "env(GOOGLE_CLIENT_ID)"
+secret = "env(GOOGLE_SECRET)"
+redirect_uri = "http://127.0.0.1:54321/auth/v1/callback"
+```
+
+Restart stack setelah edit: `supabase stop && supabase start`.
+
+## Hello-world
+
+Pakai `@supabase/supabase-js` (client SDK universal) atau `@supabase/ssr` (Next.js/SvelteKit/Remix). Contoh email signup + signin:
+
+```ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient(
+  process.env.NEXT_PUBLIC_SUPABASE_URL!,
+  process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!
+)
+
+// Signup
+const { data, error } = await supabase.auth.signUp({
+  email: 'user@example.com',
+  password: 'StrongPass123!'
+})
+// data.user.id = uuid yang dipakai foreign key di tabel aplikasi
+
+// Signin
+await supabase.auth.signInWithPassword({
+  email: 'user@example.com',
+  password: 'StrongPass123!'
+})
+
+// Cek session
+const { data: { user } } = await supabase.auth.getUser()
+
+// Signout
+await supabase.auth.signOut()
+```
+
+End-to-end pattern untuk Next.js (cookie-based, SSR-aware) di [S1 journey](/id/supabase/journeys/s1-auth-crud).
+
+## Auth methods
+
+Yang tersedia, kapan dipakai, gotcha-nya:
+
+| Method | Use-case | Gotcha |
+|---|---|---|
+| Email + password | default, paling banyak | butuh password reset flow, MFA sangat dianjurkan |
+| Magic link (email OTP) | passwordless, friction rendah | user tidak punya email reliable = stuck |
+| Phone OTP (SMS) | mobile app target Asia Tenggara, user tidak punya email | mahal di skala, provider eksternal, fraud risk |
+| OAuth (Google/GitHub/Apple/...) | login cepat, akun verified | redirect URI configuration sering keliru |
+| Anonymous sign-in | guest mode, baru migrate ke akun penuh nanti | RLS policy lebih kompleks (anonymous juga punya uid) |
+| SSO (SAML 2.0) | enterprise, Pro plan ke atas | konfigurasi per IdP, support limited |
+
+### Email + password
+
+Default. Activate via `[auth.email] enable_signup = true`.
+
+```ts
+await supabase.auth.signUp({ email, password })
+await supabase.auth.signInWithPassword({ email, password })
+await supabase.auth.resetPasswordForEmail(email, {
+  redirectTo: 'https://app.example.com/reset-password'
+})
+await supabase.auth.updateUser({ password: newPassword })
+```
+
+Password minimum 6 char default. Tweak di config:
+
+```toml
+[auth]
+minimum_password_length = 8
+password_requirements = "lower_upper_letters_digits_symbols"
+```
+
+### Magic link
+
+User klik link di email, login otomatis. Tidak ada password.
+
+```ts
+await supabase.auth.signInWithOtp({
+  email: 'user@example.com',
+  options: {
+    emailRedirectTo: 'https://app.example.com/auth/callback'
+  }
+})
+```
+
+User dapat email berisi link. Klik link buka `/auth/callback` di app, callback handle dengan exchange code untuk session.
+
+### Phone OTP
+
+```ts
+// Request OTP
+await supabase.auth.signInWithOtp({
+  phone: '+628123456789'
+})
+
+// User dapat SMS, masukkan ke form
+await supabase.auth.verifyOtp({
+  phone: '+628123456789',
+  token: '123456',
+  type: 'sms'
+})
+```
+
+Butuh SMS provider configured di Dashboard (Twilio, MessageBird, Vonage, Textlocal).
+
+### OAuth
+
+```ts
+await supabase.auth.signInWithOAuth({
+  provider: 'google',
+  options: {
+    redirectTo: 'https://app.example.com/auth/callback'
+  }
+})
+```
+
+Provider config di Dashboard (production) atau `config.toml [auth.external.google]` (lokal). Provider supported: Apple, Azure, BitBucket, Discord, Facebook, Figma, GitHub, GitLab, Google, Kakao, Keycloak, LinkedIn (OIDC), Notion, Slack, Spotify, Twitch, Twitter, WorkOS, Zoom.
+
+Redirect URI yang harus di-setup di provider console:
+
+```
+https://<project-ref>.supabase.co/auth/v1/callback
+```
+
+### Anonymous sign-in
+
+User dapat akun tanpa email/phone/OAuth:
+
+```ts
+const { data } = await supabase.auth.signInAnonymously()
+// data.user.id = uuid, can be used as foreign key
+```
+
+Aktivasi di `config.toml`:
+
+```toml
+[auth]
+enable_anonymous_sign_ins = true
+```
+
+Anonymous user dapat JWT dengan claim `is_anonymous: true`. Bisa upgrade ke akun permanen dengan link identity (email/OAuth) ke uid yang sama, semua data tetap.
+
+```ts
+await supabase.auth.updateUser({
+  email: 'user@example.com'
+})
+// triggers email confirmation, after confirm user is no longer anonymous
+```
+
+Gotcha RLS: kalau policy `to authenticated`, anonymous user MATCH (juga authenticated). Untuk membatasi cuma user yang sudah punya email, tambahin condition:
+
+```sql
+create policy "real users only" on important_table for all to authenticated
+  using ((auth.jwt() ->> 'is_anonymous')::boolean is false);
+```
+
+## JWT structure
+
+Setelah login, server kasih JWT. Decode (debug-purpose) untuk lihat isi:
+
+```json
+{
+  "aud": "authenticated",
+  "exp": 1730000000,
+  "sub": "abc-123-uuid",
+  "email": "user@example.com",
+  "phone": "",
+  "role": "authenticated",
+  "aal": "aal1",
+  "amr": [{ "method": "password", "timestamp": 1729996400 }],
+  "session_id": "session-uuid",
+  "is_anonymous": false
+}
+```
+
+Field penting untuk RLS:
+
+- **sub**: user UUID. Diakses di policy via `auth.uid()`.
+- **role**: Postgres role yang aktif. `authenticated` untuk user login, `anon` untuk yang belum.
+- **aal**: Authenticator Assurance Level. `aal1` = single factor (password atau OAuth). `aal2` = MFA selesai.
+- **amr**: Auth Method Reference. Array method dipakai (`password`, `totp`, `oauth`, dll).
+- **email**: bisa diakses di policy via `auth.jwt() ->> 'email'`.
+
+Custom claim ditambah via Hook (lihat section RBAC di bawah). Tambah `user_role`, `org_id`, atau apa saja yang sering dipakai policy.
+
+### JWT signing keys (asymmetric)
+
+Sejak 2025, Supabase support asymmetric JWT signing (ES256). Lawan model lama (HS256, satu secret bersama), asymmetric:
+
+- Public key bisa di-share aman, private key cuma di GoTrue.
+- Library third-party bisa verify JWT tanpa terima secret.
+- Rotation lebih aman dan bisa dilakukan tanpa downtime.
+
+Migrate dari HS256 ke ES256 di Dashboard. Backward compatible: token lama tetap valid sampai expire.
+
+## MFA (Multi-Factor Authentication)
+
+### TOTP (Authenticator app)
+
+Flow:
+
+```ts
+// Step 1: enroll factor (Authenticator app scan QR)
+const { data } = await supabase.auth.mfa.enroll({ factorType: 'totp' })
+const qrSvg = data.totp.qr_code  // <img src={qrSvg} />
+const factorId = data.id
+
+// Step 2: user masukkan kode 6 digit dari app
+const challenge = await supabase.auth.mfa.challenge({ factorId })
+
+const { error } = await supabase.auth.mfa.verify({
+  factorId,
+  challengeId: challenge.data.id,
+  code: '123456'
+})
+
+// Setelah verify, JWT user upgrade jadi aal2
+```
+
+Setelah enroll, login flow nambah satu step:
+
+```ts
+// 1. Login pakai password (aal1)
+await supabase.auth.signInWithPassword({ email, password })
+
+// 2. List factor yang user punya
+const { data: factors } = await supabase.auth.mfa.listFactors()
+const totpFactor = factors.totp[0]
+
+// 3. Challenge + verify
+const challenge = await supabase.auth.mfa.challenge({ factorId: totpFactor.id })
+await supabase.auth.mfa.verify({
+  factorId: totpFactor.id,
+  challengeId: challenge.data.id,
+  code: userInput
+})
+// JWT sekarang aal2
+```
+
+### Phone (SMS/WhatsApp) MFA
+
+Sama flow, beda factorType:
+
+```ts
+await supabase.auth.mfa.enroll({
+  factorType: 'phone',
+  phone: '+628123456789'
+})
+```
+
+User dapat SMS/WhatsApp dengan kode. Verify dengan `mfa.verify()`. Butuh SMS provider configured.
+
+### Enforce MFA di RLS (step-up auth)
+
+Buat policy yang require `aal2` untuk operasi sensitif:
+
+```sql
+-- View biasa
+create policy "any auth user can view" on notes for select to authenticated
+  using ((select auth.uid()) = user_id);
+
+-- Delete butuh MFA
+create policy "only mfa users can delete" on notes for delete to authenticated
+  using (
+    (select auth.uid()) = user_id
+    and (auth.jwt() ->> 'aal') = 'aal2'
+  );
+```
+
+User yang login tanpa MFA bisa view, tidak bisa delete sampai aal2.
+
+## OAuth providers
+
+Setup OAuth Google sebagai contoh:
+
+1. **Google Cloud Console**: Create OAuth 2.0 Client ID. Authorized redirect URI: `https://<project-ref>.supabase.co/auth/v1/callback` (production) atau `http://127.0.0.1:54321/auth/v1/callback` (lokal).
+
+2. **Supabase Dashboard**: Authentication > Providers > Google. Paste Client ID + Secret. Set Authorized Client IDs kalau pakai Google One Tap.
+
+3. **App**:
+
+   ```ts
+   await supabase.auth.signInWithOAuth({
+     provider: 'google',
+     options: {
+       redirectTo: 'https://app.example.com/auth/callback'
+     }
+     })
+   ```
+
+4. **Callback handler** (`/auth/callback`):
+
+   ```ts
+   import { createClient } from '@/lib/supabase/server'
+   import { NextResponse } from 'next/server'
+
+   export async function GET(request: Request) {
+     const { searchParams, origin } = new URL(request.url)
+     const code = searchParams.get('code')
+
+     if (code) {
+       const supabase = await createClient()
+       await supabase.auth.exchangeCodeForSession(code)
+     }
+
+     return NextResponse.redirect(`${origin}/dashboard`)
+   }
+   ```
+
+PKCE flow default untuk client OAuth modern. Server exchange code untuk session, set cookie.
+
+## Auth Hooks
+
+Hook = function Postgres yang dipanggil GoTrue di lifecycle event. Empat hook utama:
+
+| Hook | Trigger | Use-case |
+|---|---|---|
+| Custom Access Token | sebelum issue JWT | inject custom claim (role, org_id) |
+| Password Verification Attempt | tiap signin attempt | rate limit per email, audit log |
+| Send Email | sebelum kirim email | route via custom SMTP, custom template per locale |
+| Send SMS | sebelum kirim SMS | route via custom SMS provider |
+
+### Custom Access Token (RBAC pattern)
+
+Tambah claim `user_role` ke JWT supaya policy bisa cek tanpa query DB:
+
+```sql
+-- supabase/migrations/<timestamp>_custom_claims_hook.sql
+
+create or replace function public.add_user_role_to_jwt(event jsonb)
+returns jsonb
+set search_path = ''
+language plpgsql
+as $$
+declare
+  user_role text;
+begin
+  select role into user_role
+  from public.user_roles
+  where user_id = (event->>'user_id')::uuid;
+
+  return jsonb_set(
+    event,
+    '{claims,user_role}',
+    to_jsonb(coalesce(user_role, 'user'))
+  );
+end;
+$$;
+
+-- Grant ke supabase_auth_admin (role yang dipakai GoTrue)
+grant execute on function public.add_user_role_to_jwt(jsonb) to supabase_auth_admin;
+grant usage on schema public to supabase_auth_admin;
+```
+
+Daftarkan hook di `config.toml`:
+
+```toml
+[auth.hook.custom_access_token]
+enabled = true
+uri = "pg-functions://postgres/public/add_user_role_to_jwt"
+```
+
+Atau lewat Dashboard untuk production project.
+
+Sekarang policy bisa cek:
+
+```sql
+create policy "admin sees all" on audit_logs for select to authenticated
+  using ((auth.jwt() ->> 'user_role') = 'admin');
+```
+
+Trade-off: claim cuma update saat user re-login. Role change baru efektif setelah session refresh.
+
+### Password Verification Attempt
+
+Limit brute force per email + audit log:
+
+```sql
+create or replace function public.log_signin_attempt(event jsonb)
+returns jsonb
+set search_path = ''
+language plpgsql
+as $$
+begin
+  insert into public.signin_attempts (email, success, attempted_at)
+  values (
+    event->>'email',
+    (event->>'valid')::boolean,
+    now()
+  );
+  return event;
+end;
+$$;
+```
+
+Tidak block attempt, cuma log. Untuk rate limit, return event modified.
+
+## Cookies + Session (SSR)
+
+Buat Next.js / Remix / SvelteKit, pakai `@supabase/ssr`. Session disimpan di HttpOnly cookie, refresh otomatis lewat middleware. Detail di [S1 Step 4](/id/supabase/journeys/s1-auth-crud#step-4-middleware-untuk-refresh-session).
+
+Kunci penting:
+
+- `getSession()` baca cookie tanpa verify. Cepat tapi tidak aman untuk auth decision.
+- `getUser()` verify ke server, return verified user. Pakai ini untuk decision yang penting.
+- Middleware refresh wajib supaya JWT tidak expire silent.
+- Cookie name default `sb-<project-ref>-auth-token`.
+
+## Gotcha
+
+- **`auth.users` dikelola GoTrue**: jangan insert/update direct (kecuali admin script pakai service_role + email verification flow). Pakai SDK auth method.
+- **Email confirmation default production**: `enable_confirmations = true` di Dashboard project baru. User signup tapi tidak bisa login sampai klik link. Setup SMTP atau ganti dengan magic link kalau friction terlalu tinggi.
+- **Inbucket cuma di lokal**: jangan asumsi prod kirim ke catcher. Setup SMTP eksternal (SendGrid, Mailgun, AWS SES, Resend) di Dashboard sebelum invite user beneran.
+- **OAuth redirect URI tidak match**: error paling umum di setup OAuth. URI di provider console harus persis sama dengan yang di-config Supabase. Trailing slash, http vs https, www atau bukan, semua matter.
+- **Anonymous user counted di MAU**: setiap `signInAnonymously()` bikin row di `auth.users`. Kalau guest pattern di-pakai berlebihan, MAU explode. Cleanup periodically atau retain limit.
+- **Session di SSR tidak refresh**: tanpa middleware, JWT expire di tengah session, user logout silent. Setup middleware di Next.js, pasang `getUser()` early.
+- **`auth.uid()` di Postgres function**: kalau dipanggil dari trigger atau function tanpa JWT context (mis. cron job), return NULL. Selalu handle null case.
+- **`is_anonymous` claim tidak ada di JWT lama**: kalau project udah lama dan baru aktifkan anonymous sign-in, hook custom claim atau policy yang reference `is_anonymous` perlu fallback.
+- **SMS provider mahal di Asia Tenggara**: Twilio SMS Indonesia $0.05-0.10 per SMS. 10K signup = $500-1000. Pertimbangkan WhatsApp Business API atau magic link sebagai default, SMS sebagai fallback.
+
+## Cross-provider
+
+| Capability | Supabase Auth | AWS Cognito | Azure Entra ID B2C | GCP Identity Platform | Auth0 |
+|---|---|---|---|---|---|
+| Email/Password | built-in | built-in | built-in | built-in | built-in |
+| OAuth provider | 18+ built-in | banyak via IdP | banyak | banyak | banyak |
+| Magic link | built-in | passwordless | configurable | configurable | passwordless |
+| MFA TOTP | built-in | built-in | built-in | built-in | built-in |
+| MFA SMS | provider eksternal | included (per-region) | included | included | provider eksternal |
+| Anonymous user | built-in | guest identities | tidak | anonymous auth | tidak |
+| Custom JWT claim | hook function | Pre Token Generation Lambda | claim mapping | hook | rule + action |
+| User table di app DB | langsung (`auth.users`) | terpisah (`Cognito User Pool`) | terpisah | terpisah (`auth/users`) | terpisah |
+| Per-row authorization | RLS built-in | IAM/Lambda authorizer terpisah | RLS native | Firestore rules | terpisah |
+| Pricing model | MAU | MAU | MAU | MAU | MAU + feature tier |
+| Free tier | 50K MAU | 50K MAU | 50K MAU | 50K MAU | 25K MAU |
+
+Positioning: Supabase Auth optimal untuk app yang pakai Postgres + RLS sebagai data layer. Integrasi tight dengan auth schema dan policy bikin per-row security low-friction. Untuk enterprise SSO complex (banyak IdP, attribute mapping kompleks), Entra ID atau Auth0 lebih mature. Untuk mobile-first app yang heavy di phone OTP, perbandingan biaya SMS jadi penentu.
+
+Dibanding Cognito: Cognito lebih fleksibel di custom flow (User Pool dengan triggers Lambda di 9+ event point), tapi setup lebih banyak. Supabase Auth lebih opinionated, integrasi lebih cepat, ekosistem hook lebih sederhana.
+
+## Setelah ini
+
+- End-to-end Auth + CRUD: [S1 journey](/id/supabase/journeys/s1-auth-crud)
+- RBAC pattern dengan custom claim: [Database service / RLS pattern 4](/id/supabase/services/database#pattern-4-rbac-via-custom-claim-di-jwt)
+- Track RLS policy yang reference auth claim: [RLS Workflow](/id/supabase/tools/rls-workflow)
+- Cookie + SSR setup detail: [S1 Step 4](/id/supabase/journeys/s1-auth-crud#step-4-middleware-untuk-refresh-session)
