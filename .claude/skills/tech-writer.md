@@ -40,10 +40,72 @@ These patterns scream "written by AI". Avoid them.
 
 ## MDX Gotcha
 
-- Hindari `<NUMBER` di prose (mis. `<5ms`, `<$1`). MDX parser anggap sebagai opening JSX tag, build error. Pakai `kurang dari 5ms`, atau wrap backtick: `` `<5ms` ``.
-- Hindari `<word` tanpa spasi setelahnya di prose. Sama alasan.
-- HTML mentah di luar code block harus pakai pure JSX (`<br />` bukan `<br>`). Lebih aman: hindari HTML mentah, pakai komponen.
+Pattern di bawah PASTI bikin Nextra MDX parser crash dengan error tipe `Unexpected character '<digit>'` atau `Expected a closing tag for <word>`. Build webpack fail. Cegah sebelum tulis.
+
+### 1. `<NUMBER` di prose
+
+```
+Cold start <5ms.            ← BREAK
+Threshold di bawah 0.5.     ← OK
+Threshold (>0.8).           ← OK (cuma `<` yang trigger JSX parser)
+Threshold `<0.5`.           ← OK (inline code)
+```
+
+Pattern bahaya: `<5ms`, `<1s`, `<$100`, `<10%`, `<0.5`. Apa pun yang `<` + digit langsung.
+
+Fix: `kurang dari 5ms`, `di bawah 0.5`, atau wrap backtick `` `<5ms` ``.
+
+### 2. `<word>` JSX-like tag di prose
+
+```
+Output muncul "<email A> sedang mengetik".    ← BREAK (<email> dianggap JSX)
+Output muncul `<email A> sedang mengetik`.    ← OK (inline code)
+Output muncul "[email A] sedang mengetik".    ← OK (square bracket)
+```
+
+Pattern bahaya: `<email>`, `<user>`, `<role>`, `<id>`, `<token>`, `<placeholder>` di prose.
+
+Fix: wrap backtick atau ganti dengan `[label]` style atau `&lt;label&gt;` HTML entity.
+
+### 3. `${{ ... }}` di YAML code block
+
+```yaml
+env:
+  TOKEN: ${{ secrets.TOKEN }}    ← BREAK walau di dalam fence
+```
+
+Walau di dalam ` ```yaml ` fence, Nextra MDX expression parser tetap parse `${{ ... }}` sebagai JSX expression. Build fail dengan `TypeError: ... is not a function`.
+
+Fix opsi:
+- Placeholder env var: `TOKEN: $SECRET_TOKEN` + catatan "ganti dengan GitHub Actions secret syntax di repo kamu"
+- Single curly: `TOKEN: $secret_token` (kalau pakai bash style)
+- Pisah pakai catatan teks: "Set lewat `${{ secrets.NAME }}` (escape needed di MDX)"
+
+### 4. Unicode AI-fingerprint chars
+
+Bukan MDX parse issue, tapi gampang nyelip dari training data atau salin-tempel. Sapu sebelum commit:
+
+- `→` (U+2192) arrow. Ganti `->`, atau rewrite kalimat.
+- `—` (U+2014) em dash. Ganti `-`, `,`, `:`, atau split kalimat (lihat anti-AI rule #1).
+- `–` (U+2013) en dash. Ganti `-`.
+- `…` (U+2026) ellipsis. Ganti `...`.
+- `"` `"` `'` `'` smart quotes. Ganti `"` `'` ASCII.
+
+### 5. HTML mentah & pipe
+
+- HTML mentah di luar code block harus pure JSX (`<br />` bukan `<br>`). Lebih aman: hindari HTML mentah, pakai komponen.
 - Pipe `|` di tabel: kalau cell-nya ada `|` literal, escape `\|`.
+
+### Pre-commit check
+
+Jalanin sebelum build untuk catch pattern bahaya:
+
+```bash
+# Cari pola yang ke-flag
+grep -rn -E "<[0-9]|<[a-z]+>" content/
+grep -rn -E "[→—–…]" content/
+grep -rn -F '${{' content/
+```
 
 ## Page Template (locked)
 
