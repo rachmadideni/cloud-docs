@@ -3,5 +3,6 @@ export default {
   database: 'Database (Postgres)',
   auth: 'Auth (GoTrue)',
   storage: 'Storage',
-  'edge-functions': 'Edge Functions'
+  'edge-functions': 'Edge Functions',
+  vector: 'Vector (pgvector)'
 }
