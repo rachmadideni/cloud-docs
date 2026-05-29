@@ -4,5 +4,6 @@ export default {
   auth: 'Auth (GoTrue)',
   storage: 'Storage',
   'edge-functions': 'Edge Functions',
+  realtime: 'Realtime',
   vector: 'Vector (pgvector)'
 }
