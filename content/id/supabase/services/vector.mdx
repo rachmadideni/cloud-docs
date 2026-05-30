@@ -1,0 +1,429 @@
+# Vector (pgvector)
+
+**TL;DR**: Ekstensi Postgres untuk simpan embedding (vektor float) sebagai kolom, plus similarity search via operator distance. Tidak butuh vector DB terpisah. Kolom vector ada di tabel yang sama dengan data lain, JOIN normal, transaction guarantee, RLS otomatis apply.
+
+**Analogi**: Pinecone, Weaviate, Qdrant, tapi di dalam Postgres. Trade-off: scale lebih kecil (puluhan juta vector vs miliar), feature lebih sederhana, integration jauh lebih tight dengan data relational.
+
+## Perfect use-case
+
+- Semantic search di app B2C/B2B yang udah pakai Postgres (knowledge base, dokumen, note app)
+- RAG dengan dokumen volume sedang (di bawah 10 juta chunk)
+- Recommendation system pakai embedding (similar product, user-similarity)
+- Image similarity search (embed image pakai CLIP, simpan vector)
+- Hybrid search: kombinasi vector + full-text (BM25) di query yang sama
+- Multi-tenant search dengan RLS auto-filter (user A query tidak return data user B)
+
+## Anti use-case
+
+- Skala miliaran vector dengan throughput query tinggi (di atas 1000 QPS). Pinecone, Weaviate, atau Qdrant scale lebih jauh.
+- Filter metadata super-complex (10+ dimensi filter di tiap query). Vector DB dedicated lebih optimal.
+- Workload yang butuh sparse vector (BM25-like, atau sparse from text encoder). pgvector cuma support dense vector.
+- Aplikasi yang tidak punya Postgres sebagai primary DB. Menambah Postgres cuma untuk vector overkill, lebih efisien Vector DB dedicated.
+
+## Pricing mental model
+
+Pricing pgvector ikut Database service:
+
+- **Storage**: vector 1536-dim = ~6 KB per row. 100K embedding = ~600 MB. Hitung di DB storage quota.
+- **Index storage**: HNSW index size ~50-100% dari data. 600 MB embedding = 300-600 MB index tambahan.
+- **Compute**: similarity search bisa berat di CPU. Index HNSW jauh ngurangin, tapi tetap butuh RAM untuk index resident.
+- **Embedding API**: pgvector tidak generate embedding. Pakai service eksternal (OpenAI, Voyage, Cohere) atau model open-source self-host. Cost terpisah, charge per provider.
+
+Yang sering miss:
+
+- Embedding 1536-dim sering muat di RAM Free/Pro plan sampai puluhan ribu. Jutaan vector butuh compute add-on agar index tetap resident.
+- Index HNSW build sekali, query cepat. Tapi build slow di dataset besar (jam-jam untuk 1M+ vector). Schedule build saat low-traffic.
+
+## Local emulator
+
+pgvector enabled via migration:
+
+```sql
+create extension if not exists vector with schema extensions;
+```
+
+Connect ke Postgres lokal (port 54322), pakai operator `<=>`, `<->`, `<#>` seperti biasa.
+
+Detail di [Database service](/id/supabase/services/database) dan [Tools / Local Stack](/id/supabase/tools/local-stack).
+
+## Hello-world
+
+```sql
+create extension if not exists vector with schema extensions;
+
+create table documents (
+  id uuid primary key default gen_random_uuid(),
+  content text,
+  embedding vector(1536)
+);
+
+-- Insert dummy embedding (random untuk demo)
+insert into documents (content, embedding)
+select 'doc ' || i, array_fill(random()::real, array[1536])::vector
+from generate_series(1, 100) i;
+
+-- Similarity search
+select content, 1 - (embedding <=> '[0.1, 0.2, ...]'::vector(1536)) as similarity
+from documents
+order by embedding <=> '[0.1, 0.2, ...]'::vector(1536)
+limit 5;
+```
+
+End-to-end pattern dengan embedding API + RAG + LLM di [S5 journey](/id/supabase/journeys/s5-rag).
+
+## Operator distance
+
+pgvector punya tiga operator distance, masing-masing untuk metrik berbeda:
+
+| Operator | Metrik | Use-case typical |
+|---|---|---|
+| `<=>` | Cosine distance | Text embedding (OpenAI, Cohere, Voyage). Default untuk normalized vector. |
+| `<->` | Euclidean (L2) | Image embedding raw, geo-spatial |
+| `<#>` | Negative inner product | Performance-sensitive, tapi butuh vector normalized |
+
+Untuk text embedding mainstream (OpenAI text-embedding-3-small/large, Voyage, Cohere), vector di-normalize default. Tiga operator hasilnya ekuivalen ranking, tapi nilai distance berbeda. Konvensi: `<=>` cosine.
+
+### Similarity vs distance
+
+Distance: 0 = identik, makin besar makin beda. Cosine distance range [0, 2].
+
+Similarity: 1 = identik, makin kecil makin beda. Cosine similarity range [-1, 1].
+
+Konversi: `similarity = 1 - distance`. Sering lebih intuitive return similarity score ke aplikasi:
+
+```sql
+1 - (embedding <=> query_embedding) as similarity
+```
+
+## Index types
+
+Tanpa index, similarity search adalah sequential scan: hitung distance ke semua row, sort. OK untuk seribu-an row, slow untuk jutaan.
+
+Dua index type yang tersedia:
+
+### HNSW (Hierarchical Navigable Small World)
+
+```sql
+create index documents_embedding_idx on documents
+  using hnsw (embedding vector_cosine_ops);
+```
+
+Karakteristik:
+
+- **Build slow**: build di 1M vector bisa makan jam-jam.
+- **Query super cepat**: query latency stabil meskipun dataset besar.
+- **Memory hungry**: index size ~50-100% data, harus muat di RAM untuk performance.
+- **Akurasi tinggi**: recall di atas 95% dengan tuning default.
+- **Tidak butuh re-train**: insert/update baru langsung ke-index incremental.
+
+Pakai HNSW kalau: query latency critical, dataset relatif stabil ukurannya (atau growth gradual).
+
+### IVFFlat (Inverted File with Flat compression)
+
+```sql
+create index documents_embedding_idx on documents
+  using ivfflat (embedding vector_cosine_ops)
+  with (lists = 100);  -- jumlah cluster
+```
+
+Karakteristik:
+
+- **Build cepat**: build di 1M vector dalam menit.
+- **Query lebih lambat dari HNSW**: 2-5x lebih lambat di skala sama.
+- **Memory friendly**: index lebih kecil, query bisa pakai disk.
+- **Butuh re-train**: kalau data berubah banyak, akurasi turun. Rebuild index periodik.
+- **Tuning lists**: jumlah cluster. Rule of thumb: `lists = rows / 1000` (untuk row di atas 1 juta), `lists = sqrt(rows)` untuk lebih kecil.
+
+Pakai IVFFlat kalau: dataset banyak berubah, RAM terbatas, query latency tidak sangat ketat.
+
+### Operator class per distance
+
+Pilih operator class sesuai distance yang dipakai:
+
+| Distance operator | Operator class |
+|---|---|
+| `<=>` cosine | `vector_cosine_ops` |
+| `<->` L2 | `vector_l2_ops` |
+| `<#>` inner product | `vector_ip_ops` |
+
+Mismatch antara index ops dan query operator = index tidak ke-pakai, query jadi seq scan.
+
+## Dimensi vector
+
+Pilih dimensi berdasarkan model embedding:
+
+| Model | Default dim | Min via `dimensions` param |
+|---|---|---|
+| OpenAI text-embedding-3-small | 1536 | 512 |
+| OpenAI text-embedding-3-large | 3072 | 256 |
+| OpenAI text-embedding-ada-002 (legacy) | 1536 | fixed |
+| Cohere embed-v3 | 1024 | 256, 384, 1024 |
+| Voyage voyage-2 | 1024 | fixed |
+| Hugging Face (varies) | 384, 768, 1024 | model-spesifik |
+
+### Trade-off dimensi vs akurasi
+
+Dimensi lebih kecil:
+
+- Storage lebih hemat (proporsional)
+- Query lebih cepat
+- Akurasi turun 5-10% untuk text similarity typical
+
+Dimensi lebih besar:
+
+- Storage besar
+- Index size besar
+- Akurasi sedikit lebih tinggi, return diminishing setelah dimensi cukup
+
+Untuk app skala kecil-menengah: 1536 dim text-embedding-3-small balance terbaik. Untuk skala besar atau cost-sensitive: 512 dim sama model, lihat apakah akurasi drop acceptable.
+
+### Pakai dimensi yang sama di schema dan model
+
+```sql
+-- Schema declare 1536
+embedding vector(1536)
+```
+
+```ts
+// Call API juga 1536
+{
+  model: 'text-embedding-3-small',
+  dimensions: 1536  // explicit, atau skip karena default
+}
+```
+
+Mismatch = error `expected 1536 dimensions, not 512`.
+
+Ganti model = harus re-embed semua. Tidak ada migrasi reversible vector ke dimensi berbeda.
+
+## Hybrid search
+
+Kombinasi vector similarity + full-text search. Vector capture semantic, full-text capture exact keyword. Kombinasi lebih robust dari salah satu saja.
+
+### Setup full-text
+
+```sql
+alter table documents
+  add column fts tsvector
+  generated always as (to_tsvector('indonesian', content)) stored;
+
+create index documents_fts_idx on documents using gin (fts);
+```
+
+### RPC hybrid
+
+```sql
+create or replace function hybrid_search(
+  query_text text,
+  query_embedding extensions.vector(1536),
+  match_count int default 10,
+  fts_weight float default 1.0,
+  vector_weight float default 1.0
+)
+returns table (id uuid, content text, score float)
+language sql stable
+as $$
+  with fts as (
+    select id, content, ts_rank_cd(fts, websearch_to_tsquery('indonesian', query_text)) as rank
+    from documents
+    where fts @@ websearch_to_tsquery('indonesian', query_text)
+    order by rank desc
+    limit match_count * 2
+  ),
+  vector as (
+    select id, content, 1 - (embedding <=> query_embedding) as similarity
+    from documents
+    order by embedding <=> query_embedding
+    limit match_count * 2
+  )
+  select
+    coalesce(f.id, v.id) as id,
+    coalesce(f.content, v.content) as content,
+    (coalesce(f.rank, 0) * fts_weight + coalesce(v.similarity, 0) * vector_weight) as score
+  from fts f
+  full outer join vector v on f.id = v.id
+  order by score desc
+  limit match_count;
+$$;
+```
+
+Tuning `fts_weight` dan `vector_weight` per use-case. Lebih weight ke vector untuk query natural language. Lebih weight ke fts untuk query keyword-spesifik.
+
+Reciprocal Rank Fusion (RRF) variant yang lebih advanced:
+
+```sql
+-- score = sum(1 / (k + rank)) per source
+```
+
+Detail di blog Supabase official.
+
+## Filter metadata
+
+pgvector kombinasikan baik dengan filter SQL biasa. Filter di WHERE clause apply sebelum vector search:
+
+```sql
+select content, 1 - (embedding <=> $1) as similarity
+from documents
+where category = 'manual'                -- filter pre-vector
+  and created_at > now() - interval '30 days'
+order by embedding <=> $1
+limit 10;
+```
+
+Performance: index pgvector bekerja optimal di full table scan. Filter selective (return sedikit row) bisa lebih lambat dari skip filter karena tidak pakai index vector.
+
+Strategi:
+
+- **Filter selective rendah** (return banyak row): filter dulu, lalu vector search. Index pgvector terpakai.
+- **Filter selective tinggi** (return sedikit row): coba post-filter, atau pakai conditional index.
+
+Conditional index untuk subset:
+
+```sql
+create index recent_documents_embedding_idx on documents
+  using hnsw (embedding vector_cosine_ops)
+  where created_at > now() - interval '30 days';
+```
+
+## RLS otomatis
+
+Vector search via RPC dengan `security invoker` apply RLS dari user yang panggil. Tidak perlu filter manual `where user_id = ...`:
+
+```sql
+create or replace function match_my_notes(
+  query_embedding extensions.vector(1536),
+  match_threshold float default 0.7,
+  match_count int default 5
+)
+returns table (id uuid, content text, similarity float)
+language sql stable
+security invoker  -- penting
+set search_path = ''
+as $$
+  select id, content, 1 - (embedding <=> query_embedding) as similarity
+  from public.notes
+  where 1 - (embedding <=> query_embedding) > match_threshold
+  order by embedding <=> query_embedding
+  limit least(match_count, 50);
+$$;
+```
+
+`security invoker` jalan dengan permission user. RLS table `notes` (mis. `user_id = auth.uid()`) auto apply. User A query tidak return note user B walau similarity tinggi.
+
+Detail di [S5 Step 5](/id/supabase/journeys/s5-rag#step-5-rpc-untuk-similarity-search).
+
+## Gotcha
+
+### Dimension mismatch fatal
+
+Schema declare `vector(1536)`, insert 512-dim array = error. Tidak ada cast otomatis. Pastikan dimensi schema = dimensi model.
+
+### Re-embed saat ganti model
+
+Ganti model embedding (mis. ada-002 ke 3-small) = embedding space beda total, tidak compatible. Harus re-embed semua. Migrasi besar.
+
+Strategi: ada job re-embed batch yang baca content, embed dengan model baru, write ke kolom temporary. Setelah selesai semua, swap kolom dalam transaction.
+
+### Index pakai kolom yang sebagian NULL
+
+Kalau embed async (ada delay antara insert dan embedding tergenerate), kolom embedding NULL di row baru. Search query tetap return row NULL kalau pakai sequential scan. Index HNSW skip row NULL otomatis.
+
+Pakai filter eksplisit:
+
+```sql
+where embedding is not null
+```
+
+### Filter sebelum order = index tidak terpakai
+
+```sql
+-- HNSW index tidak ke-pakai kalau filter terlalu selective
+where category = 'rare'
+order by embedding <=> $1;
+```
+
+Postgres planner sometimes pilih seq scan kalau filter return sedikit row. Cek pakai `EXPLAIN ANALYZE`. Untuk filter selective tinggi, conditional index atau post-filter pattern.
+
+### HNSW build memory-heavy
+
+Build index HNSW di 1M+ vector butuh RAM signifikan. Free/Pro shared compute bisa OOM. Strategi:
+
+```sql
+-- Tweak build parameter untuk ngurangin memory
+create index documents_embedding_idx on documents
+  using hnsw (embedding vector_cosine_ops)
+  with (m = 8, ef_construction = 32);  -- default m=16, ef_construction=64
+```
+
+Trade-off: build lebih cepat dan ringan, recall sedikit turun. Atau scale up compute saat build, scale down setelahnya.
+
+### IVFFlat lupa re-train
+
+Kalau pakai IVFFlat, data growth 5-10x dari saat index dibuat = recall turun signifikan. Rebuild periodik:
+
+```sql
+reindex index documents_embedding_idx;
+```
+
+Atau pakai HNSW yang tidak butuh re-train.
+
+### Embedding di response JSON kirim cost
+
+Vector 1536-dim = ~30 KB sebagai JSON. Kalau function return vector ke client, bandwidth boros. Strategi: jangan kirim embedding dari server, cuma id + content + similarity.
+
+### Threshold per use-case beda
+
+`match_threshold` 0.7 default umum untuk text similarity. Tapi cuma works baik kalau corpus relatif homogen. Untuk corpus campur (note pribadi + manual produk + chat history), threshold harus per-kategori atau pakai dynamic threshold (mis. ambil top-5 langsung tanpa threshold).
+
+### Vector batch insert lebih cepat dari per-row
+
+Insert per row pakai pgvector ada per-call overhead. Batch:
+
+```sql
+insert into documents (content, embedding) values
+  ('doc 1', '[...]'::vector),
+  ('doc 2', '[...]'::vector),
+  ...;
+```
+
+10x lebih cepat dari 100x per-row insert.
+
+### Hybrid weight tuning
+
+Hybrid search butuh tuning weight FTS vs vector per dataset. Default 1:1 bukan selalu optimal. Test dengan sample query yang punya jawaban ground truth, tune sampai recall+precision balance.
+
+## Cross-provider
+
+| Capability | Supabase (pgvector) | AWS | Azure | GCP | Pinecone | Weaviate |
+|---|---|---|---|---|---|---|
+| Storage backend | Postgres | RDS PG (pgvector), OpenSearch, Bedrock KB | DB for PG (pgvector), AI Search | Cloud SQL (pgvector), Vertex Matching Engine | Managed | Managed / self-host |
+| Index type | HNSW, IVFFlat | sama (di pgvector), proprietary (OpenSearch) | sama | sama | proprietary HNSW | HNSW |
+| Distance metric | cosine, L2, inner product | sama | sama | sama | cosine, L2, dot | cosine, L2, dot |
+| Hybrid search | manual via SQL FTS + vector | OpenSearch built-in, Bedrock KB built-in | AI Search built-in | Vertex Search built-in | tidak (di atas vector layer manual) | built-in |
+| Scale (vector) | jutaan | puluhan juta (BedrockKB lebih) | jutaan-puluhan juta | jutaan | miliaran | miliaran |
+| Filter metadata | full SQL | full SQL (kalau pgvector) | full SQL | full SQL | terbatas | full GraphQL |
+| Setup effort | satu RPC + index | banyak service / managed KB | service AI Search | service Vertex | provision dedicated | provision dedicated |
+| RLS auto-filter | ya via SECURITY INVOKER | manual via IAM | manual / RBAC AI Search | manual | tidak | tidak |
+| Embedding API | external (Vertex/OpenAI/Voyage) | Bedrock built-in (Titan/Cohere) | Azure OpenAI | Vertex embeddings | external | external |
+| Local emulator | bundled `supabase start` | LocalStack pgvector partial | tidak | tidak | tidak | self-host |
+
+Positioning: pgvector menang di simplicity dan tight integration. Vector di tabel sama dengan data lain, RLS otomatis, transaction guarantee. Vector DB dedicated lebih cocok kalau scale ekstrim atau filter complex non-relational.
+
+AWS Bedrock Knowledge Bases option managed "out of the box" RAG dengan minimal code, tapi lock-in + cost lebih tinggi. Untuk team yang udah pakai AWS dan butuh RAG cepat, OK. Untuk fleksibilitas dan ownership, pgvector di Supabase.
+
+## Anti-pattern
+
+- **Generate embedding sync saat insert**: blocking response, latency tinggi, retry kompleks kalau provider down. Pakai trigger + queue + async worker.
+- **Pakai `security definer` RPC untuk per-user search**: bypass RLS, semua data ke-search. Pakai `security invoker`.
+- **Skip filter `embedding is not null`** di RPC: row yang belum di-embed (cron belum jalan) hasilnya NaN, error.
+- **Vector + text di tabel sama tanpa partition**: kalau data growth besar, table jadi heavy. Partition by month atau by tenant.
+- **Threshold static across query type**: query natural language vs keyword exact butuh threshold beda. Tuning.
+- **Index HNSW di seluruh tabel padahal cuma query subset**: conditional index lebih hemat RAM dan disk.
+- **Pre-compute hybrid score untuk semua kombinasi**: hybrid query unik per request. Pakai RPC online, jangan materialize.
+
+## Setelah ini
+
+- End-to-end RAG journey dengan trigger + queue + cron worker: [S5 journey](/id/supabase/journeys/s5-rag)
+- Database service deep (extensions inventory, RLS pattern): [Database](/id/supabase/services/database)
+- Edge Function untuk embed + RAG query: [Edge Functions service](/id/supabase/services/edge-functions)
+- Track vector schema + RPC sebagai migrasi: [RLS Workflow](/id/supabase/tools/rls-workflow)

@@ -1,0 +1,462 @@
+# Storage
+
+**TL;DR**: Object storage S3-compatible di balik endpoint `/storage/v1`, dengan image transform built-in (imgproxy), upload resumable (TUS), dan RLS lewat tabel `storage.objects`. Bucket di-deklarasi via `config.toml` atau SDK, akses control via policy SQL (sama mekanisme dengan RLS biasa).
+
+**Analogi**: AWS S3 + CloudFront + Lambda@Edge (resize) jadi satu service. Dari sisi protokol: S3 API compatible, jadi tool S3 standar (aws-cli, rclone, MinIO Client) bisa langsung pakai.
+
+## Perfect use-case
+
+- User-generated content (avatar, foto, dokumen, video)
+- Asset publik dengan CDN built-in (logo, OG image, marketing media)
+- Private file dengan signed URL temporary
+- Image yang butuh resize on-demand tanpa pre-generate banyak ukuran
+- Backup dan archive dengan size limit per-bucket
+- Storage untuk RAG ingestion (PDF, dokumen, audio)
+
+## Anti use-case
+
+- Object storage skala petabyte dengan lifecycle policy complex (Glacier-tier transitions, replication cross-region). S3 native lebih mature.
+- Cold storage harga ekstra murah (Glacier, Archive). Supabase tidak ada tier.
+- Stream video transcoding (HLS, DASH). Pakai service spesialis (Mux, AWS MediaConvert).
+- Workload write-heavy yang butuh strong consistency lintas region. Single-region per project.
+
+## Pricing mental model
+
+| Dimensi | Free | Pro | Beyond |
+|---|---|---|---|
+| Storage size | 1 GB | 100 GB | $0.021/GB-month |
+| Egress bandwidth | 5 GB | 250 GB | $0.09/GB |
+| Image transform request | unlimited | unlimited | unlimited |
+| Object count | unlimited | unlimited | unlimited |
+| CDN cache | included | included | included |
+
+Yang sering miss:
+
+- **Egress = bandwidth turun ke client**. Avatar 50KB di-load 10K kali per hari = 500MB egress per hari = 15GB per bulan. Kalikan dengan jumlah asset, gampang ke triple-digit.
+- **Image transform `unlimited`** maksudnya tidak ada surcharge per transform request. Tapi response file tetap counted di bandwidth.
+- **CDN cache mengurangi egress origin**. Asset yang cache 7 hari di edge, fetch ke origin cuma sekali per region. Pasang `Cache-Control` aggressive untuk asset static.
+
+Mental model: untuk asset publik (avatar, OG image), CDN-cached. Untuk private file (dokumen user), tiap akses lewat origin Supabase, hitung egress.
+
+## Local emulator
+
+Storage jalan di Kong port 54321, S3 backend pakai container internal. Endpoint:
+
+```
+http://127.0.0.1:54321/storage/v1
+```
+
+Detail lokal di [Tools / Local Stack](/id/supabase/tools/local-stack#service-di-balik-kong).
+
+## Hello-world
+
+Upload file:
+
+```ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient(url, anonKey)
+
+const { error } = await supabase.storage
+  .from('avatars')
+  .upload('user-id/avatar.png', file, { upsert: true })
+```
+
+Public URL untuk display:
+
+```ts
+const { data: { publicUrl } } = supabase.storage
+  .from('avatars')
+  .getPublicUrl('user-id/avatar.png')
+```
+
+Signed URL untuk akses private temporary:
+
+```ts
+const { data } = await supabase.storage
+  .from('attachments')
+  .createSignedUrl('user-id/doc.pdf', 60)
+// data.signedUrl valid 60 detik
+```
+
+End-to-end pattern (avatar + per-note attachment) di [S2 journey](/id/supabase/journeys/s2-storage).
+
+## Bucket types
+
+### Public bucket
+
+Asset accessible tanpa autentikasi via URL langsung. Cocok untuk: avatar, logo, marketing asset, OG image.
+
+```toml
+[storage.buckets.public_assets]
+public = true
+file_size_limit = "5MiB"
+allowed_mime_types = ["image/*"]
+```
+
+Catatan: "public" cuma untuk SELECT (download). UPLOAD tetap butuh policy. Bucket public tanpa policy INSERT = no one bisa upload.
+
+### Private bucket
+
+Default. Semua operasi butuh policy. Cocok untuk: dokumen user, file pribadi, backup.
+
+```toml
+[storage.buckets.attachments]
+public = false
+file_size_limit = "50MiB"
+```
+
+Akses via signed URL (`createSignedUrl`) atau via SDK download dengan JWT (`download()`).
+
+### Standard vs Analytics bucket (Pro+)
+
+Supabase punya bucket type tambahan:
+
+- **Standard**: yang udah dibahas di atas, S3-compatible storage normal.
+- **Analytics**: dioptimasi untuk file analytical (Parquet, CSV) yang dibaca berulang. Lower egress cost, integrasi sama Postgres FDW.
+
+Untuk app typical, Standard. Analytics relevant kalau workload data lake.
+
+## Multi-protocol access
+
+Bucket yang sama bisa diakses lewat 3 protokol:
+
+### 1. Storage REST API
+
+Native, paling umum di Web frontend.
+
+```bash
+curl -X POST http://127.0.0.1:54321/storage/v1/object/avatars/user-id/avatar.png \
+  -H "Authorization: Bearer <jwt>" \
+  -H "Content-Type: image/png" \
+  --data-binary @avatar.png
+```
+
+### 2. S3-compatible API
+
+Pakai aws-cli langsung. Kredensial dari Dashboard atau `storage.s3_credentials` table.
+
+```bash
+# Setup ~/.aws/credentials profile
+aws configure --profile supabase
+# AWS Access Key ID: <S3 access key dari Dashboard>
+# AWS Secret Access Key: <S3 secret>
+# Default region: us-east-1
+# Default output format: json
+
+# Endpoint custom
+aws --profile supabase --endpoint-url https://<project-ref>.supabase.co/storage/v1/s3 \
+    s3 cp ./avatar.png s3://avatars/user-id/avatar.png
+```
+
+Pakai untuk: bulk upload, migration dari S3, integrasi tool yang udah pakai S3 SDK.
+
+### 3. TUS (resumable upload)
+
+Protocol untuk upload file besar dengan pause/resume. Endpoint:
+
+```
+https://<project-ref>.supabase.co/storage/v1/upload/resumable
+```
+
+Pakai client library: `tus-js-client` atau `Uppy` dengan plugin Tus.
+
+```ts
+import * as tus from 'tus-js-client'
+
+const upload = new tus.Upload(file, {
+  endpoint: 'https://<project-ref>.supabase.co/storage/v1/upload/resumable',
+  headers: {
+    authorization: `Bearer ${session.access_token}`,
+    'x-upsert': 'true'
+  },
+  metadata: {
+    bucketName: 'attachments',
+    objectName: 'user-id/big-video.mp4',
+    contentType: 'video/mp4'
+  },
+  chunkSize: 6 * 1024 * 1024,  // 6 MB chunk
+  onError: (err) => console.error(err),
+  onProgress: (uploaded, total) => {
+    console.log(`${((uploaded / total) * 100).toFixed(1)}%`)
+  },
+  onSuccess: () => console.log('done')
+})
+
+upload.start()
+```
+
+Pakai untuk: file di atas 50 MB, upload di mobile dengan koneksi tidak stabil, video panjang.
+
+Trade-off: resumable bikin overhead protocol (multiple HTTP request per file). Untuk file kecil (di bawah 10 MB), pakai upload biasa lebih cepat.
+
+## RLS untuk Storage
+
+Mekanisme akses control = SQL policy di tabel `storage.objects`. Sama pattern dengan RLS di tabel app, dengan helper khusus.
+
+### Pattern dasar
+
+Convention: path file di-namespace per user, `<user_id>/<path>`. Cek `(storage.foldername(name))[1]` untuk verify owner.
+
+```sql
+create policy "user upload to own folder" on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'attachments'
+    and (storage.foldername(name))[1] = (select auth.uid()::text)
+  );
+
+create policy "user read own files" on storage.objects for select to authenticated
+  using (
+    bucket_id = 'attachments'
+    and (storage.foldername(name))[1] = (select auth.uid()::text)
+  );
+```
+
+`storage.foldername(name)` parse path jadi array. Path `abc-123/sub/file.png` jadi `{abc-123, sub}`.
+
+### Pattern multi-tenant (per organization)
+
+Convention path: `<org_id>/<user_id>/<filename>`. Cek member dengan helper SECURITY DEFINER (lihat [Database RLS Pattern 3](/id/supabase/services/database#pattern-3-multi-tenant-via-membership-table)).
+
+```sql
+create policy "org member upload" on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'team_files'
+    and private.is_member_of_org(
+      (storage.foldername(name))[1]::uuid,
+      (select auth.uid())
+    )
+  );
+```
+
+### Pattern public read + auth write
+
+```sql
+-- Public read semua file di bucket
+create policy "anyone read" on storage.objects for select
+  using (bucket_id = 'public_assets');
+
+-- Cuma auth user yang bisa upload, ke folder mereka sendiri
+create policy "auth user upload own" on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'public_assets'
+    and (storage.foldername(name))[1] = (select auth.uid()::text)
+  );
+```
+
+### Storage policy via SECURITY DEFINER function
+
+Untuk policy complex (mis. cek extension file + size + role), bikin function:
+
+```sql
+create or replace function private.can_upload_to_bucket(
+  p_bucket text,
+  p_path text,
+  p_user_id uuid
+) returns boolean
+set search_path = ''
+language plpgsql
+security definer
+as $$
+declare
+  user_quota_used bigint;
+  user_quota_limit bigint := 1024 * 1024 * 1024;  -- 1 GB
+begin
+  -- Cek quota user
+  select coalesce(sum(metadata->>'size')::bigint, 0)
+  into user_quota_used
+  from storage.objects
+  where (storage.foldername(name))[1] = p_user_id::text;
+
+  return user_quota_used < user_quota_limit;
+end;
+$$;
+
+create policy "respect user quota" on storage.objects for insert to authenticated
+  with check (
+    bucket_id = 'attachments'
+    and private.can_upload_to_bucket(bucket_id, name, (select auth.uid()))
+  );
+```
+
+Track policy sebagai migrasi, test pakai pgTAP. Detail di [RLS Workflow](/id/supabase/tools/rls-workflow).
+
+## Image Transform
+
+imgproxy proxy on-demand untuk image dari bucket. Pakai URL parameter:
+
+```
+/storage/v1/render/image/public/<bucket>/<path>?width=200&height=200&resize=cover
+```
+
+Atau lewat SDK:
+
+```ts
+supabase.storage.from('avatars').getPublicUrl(path, {
+  transform: {
+    width: 800,
+    height: 300,
+    quality: 75,
+    format: 'origin',
+    resize: 'cover'
+  }
+})
+```
+
+Untuk private bucket pakai signed URL dengan transform:
+
+```ts
+supabase.storage.from('attachments').createSignedUrl(path, 60, {
+  transform: { width: 200, height: 200 }
+})
+```
+
+### Option lengkap
+
+| Param | Value | Catatan |
+|---|---|---|
+| `width` | integer (1-2500) | px output |
+| `height` | integer (1-2500) | px output |
+| `resize` | `cover`, `contain`, `fill` | cover = crop, contain = letterbox, fill = stretch |
+| `quality` | integer (20-100) | JPEG/WebP quality, default 80 |
+| `format` | `origin`, `webp`, `jpeg`, `png` | `origin` = auto pilih (WebP kalau browser support) |
+
+Format `origin` default: kalau browser kirim `Accept: image/webp`, response WebP. Fallback JPEG. Hemat bandwidth ~25-35% vs PNG asli.
+
+### Strategi cache image transform
+
+Tiap request transform jadi kalkulasi imgproxy. CDN di depan storage URL cache hasil per URL unique:
+
+- `/avatars/x.png?width=200&height=200` di-cache 1x
+- `/avatars/x.png?width=200&height=300` di-cache lagi (URL beda)
+
+Pakai dimensi yang konsisten (mis. 200, 400, 800 saja, tidak random) supaya cache hit ratio tinggi.
+
+Untuk asset super high-traffic, pertimbangkan pre-generate thumbnail saat upload + simpan terpisah, lalu serve langsung dari bucket tanpa transform. Hemat compute imgproxy.
+
+## CDN dan cache
+
+Storage di production di-front oleh Cloudflare CDN global. Cache behavior:
+
+| Konten | Cache default | Override via header |
+|---|---|---|
+| Public bucket file | 1 jam | `Cache-Control` di upload metadata |
+| Signed URL | tidak (per signed URL unique) | tidak applicable |
+| Image transform | 1 jam | sama |
+
+Set `Cache-Control` saat upload supaya CDN ngerti retention:
+
+```ts
+await supabase.storage.from('avatars').upload(path, file, {
+  cacheControl: 'public, max-age=31536000, immutable',
+  contentType: 'image/png'
+})
+```
+
+`max-age=31536000` = 1 tahun. `immutable` = tidak akan berubah (CDN tidak perlu revalidate).
+
+Untuk asset yang versi-able (mis. nama file include hash content), pakai `immutable`. Untuk asset yang sama URL tapi content berubah (avatar user), pakai `max-age=3600` + cache busting via query parameter.
+
+## Gotcha
+
+### Public bucket tidak otomatis world-writable
+
+Public bucket = anyone bisa download. Upload tetap butuh INSERT policy. Lupa policy INSERT = user tidak bisa upload meskipun bucket public.
+
+### Path naming jadi mekanisme RLS
+
+`storage.foldername(name)[1]` parse string path. Kalau path `file.png` (tanpa folder), return NULL. Pastikan generate path selalu format `<scope>/<rest>` di app code. Validate sebelum upload.
+
+### Signed URL setelah delete file
+
+Generate signed URL valid 60 menit, lalu delete file dalam window itu. Signed URL **tetap valid** sampai expire. Akses return 404 (file gone). Untuk content sensitive, expiry pendek dan rotate.
+
+### File size limit per bucket vs per request
+
+`file_size_limit` di bucket = max ukuran tiap file. Tidak ada limit total ukuran bucket di sisi Supabase. Tapi kalau pakai Next.js Server Action upload, ada body limit 1 MB default Next. Pakai upload langsung dari client SDK untuk file besar, bukan via Server Action.
+
+### Multipart upload limit
+
+Upload biasa REST max 5 GB per file. Beyond itu, pakai TUS resumable.
+
+### Object listing pakai `list()` slow di folder besar
+
+`supabase.storage.from('bucket').list('folder')` return semua file di folder. Folder dengan 10K+ file = response besar. Pakai pagination + filter:
+
+```ts
+const { data } = await supabase.storage.from('attachments').list('user-id', {
+  limit: 100,
+  offset: 0,
+  sortBy: { column: 'created_at', order: 'desc' }
+})
+```
+
+### Storage tidak track usage di metadata kolom
+
+`storage.objects.metadata` jsonb contain HTTP metadata (size, mime, dll). Tapi quota per-user harus dihitung manual (mis. lewat trigger). Tidak ada built-in.
+
+### Delete cascade tidak include file
+
+`delete from note_attachments where ...` hapus row, file di Storage masih ada. Sinkron lewat trigger:
+
+```sql
+create or replace function delete_attachment_file() returns trigger
+language plpgsql security definer
+set search_path = ''
+as $$
+begin
+  perform net.http_delete(
+    url := 'http://kong:8000/storage/v1/object/attachments/' || old.storage_path,
+    headers := jsonb_build_object('apikey', current_setting('app.service_key', true))
+  );
+  return old;
+end;
+$$;
+
+create trigger before_delete_attachment
+  before delete on note_attachments
+  for each row execute function delete_attachment_file();
+```
+
+Atau cron job cleanup periodik.
+
+### CORS untuk S3 protocol
+
+Akses dari browser pakai S3 SDK butuh CORS configured. Default Supabase storage REST API CORS open, tapi S3 protocol endpoint terpisah. Set CORS di Dashboard Storage > Settings.
+
+### Resumable upload chunk size
+
+Default `tus-js-client` chunk 6 MB. Untuk mobile dengan koneksi lambat, kecilkan ke 1-2 MB supaya kalau gagal retry lebih cepat. Untuk desktop dengan koneksi cepat, naikkan ke 10-50 MB supaya HTTP overhead lebih sedikit.
+
+## Cross-provider
+
+| Capability | Supabase | AWS S3 | Azure Blob | GCP Cloud Storage |
+|---|---|---|---|---|
+| Object store | bundled di project | standalone | standalone | standalone |
+| S3 protocol | ya (compatible) | native | tidak (Blob native) | tidak (XML API) |
+| Access control | RLS via storage.objects | bucket + object policy + IAM | RBAC + SAS | IAM + signed URL |
+| Image transform | imgproxy built-in | Lambda@Edge / CloudFront Functions | Logic Apps / Function | Cloud Functions |
+| Signed URL with transform | ya | tidak (perlu Lambda) | tidak | tidak |
+| Resumable upload | TUS protocol | multipart upload | block blob | resumable upload |
+| CDN built-in | Cloudflare CDN global | CloudFront opt-in | Azure CDN opt-in | Cloud CDN opt-in |
+| Cold storage tier | tidak | Glacier, Deep Archive | Cool, Archive | Nearline, Coldline, Archive |
+| Versioning | tidak | ya | ya | ya |
+| Lifecycle policy | tidak | full | full | full |
+| Local emulator | bundled `supabase start` | LocalStack / MinIO | Azurite | gcloud emulator |
+
+Positioning: Supabase Storage menang di tight integration (RLS langsung di storage.objects, image transform tanpa CDN setup), kalah di feature enterprise (versioning, lifecycle, tiered storage). Untuk app yang fit pola "user upload + serve via CDN", paling rendah friction. Untuk skala enterprise dengan compliance retention atau cold archive, S3 / Blob lebih lengkap.
+
+## Anti-pattern
+
+- **Hardcode URL absolut ke kolom DB**: `https://project.supabase.co/storage/v1/...` lock domain. Simpan path relatif (`<user>/file.png`), generate URL on-demand pakai SDK.
+- **Pre-generate puluhan ukuran thumbnail**: image transform on-demand handle. Simpan satu original.
+- **Public bucket untuk content user**: anyone dengan URL akses. Pakai private + signed URL.
+- **Signed URL expire 7 hari**: window terlalu lebar, security benefit hilang. 60-300 detik default.
+- **Bucket tanpa `allowedMimeTypes`**: terima semua, termasuk executable. Restrict.
+- **Skip `cacheControl` di upload**: asset cached 1 jam default. Aggressive cache (jangan lupa cache-bust) reduce egress signifikan.
+
+## Setelah ini
+
+- End-to-end journey: [S2 Upload File](/id/supabase/journeys/s2-storage)
+- RLS workflow untuk policy storage: [RLS Workflow](/id/supabase/tools/rls-workflow)
+- Database service deep (foundation RLS pattern): [Database](/id/supabase/services/database)

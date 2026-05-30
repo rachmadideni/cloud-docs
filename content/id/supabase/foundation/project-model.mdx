@@ -1,0 +1,241 @@
+# Project Model
+
+Konsep "project" di Supabase punya arti spesifik yang gampang miss kalau datang dari AWS atau GCP. Halaman ini bedah hierarki organization, project, environment, dan apa yang masuk satu boundary.
+
+## Hierarchy
+
+```
+Organization
+├── Project A (production)
+│   ├── Postgres database (1 buah, dedicated)
+│   ├── Auth (GoTrue di balik kong)
+│   ├── Storage (bucket-bucket di S3 backend)
+│   ├── Edge Functions
+│   ├── Realtime server
+│   └── Studio dashboard
+├── Project B (staging)
+│   └── ... (stack stack identik, isolated dari A)
+└── Project C (lain)
+    └── ...
+```
+
+Mapping kasar ke konsep cloud lain:
+
+| Supabase | AWS | GCP | Azure |
+|---|---|---|---|
+| Organization | AWS Organization | GCP Organization | Azure AD Tenant |
+| Project | AWS Account (sebagian) | GCP Project | Azure Subscription |
+| Project-level resource | Region + VPC + IAM scope | Project scope | Resource Group |
+
+Beda penting: **1 Supabase project = 1 Postgres instance dedicated**. Tidak ada konsep "shared cluster, multi-database per project". Setiap project punya database fisik sendiri.
+
+## Project
+
+Project adalah unit isolasi paling penting:
+
+- **Punya satu Postgres database dedicated** dengan compute terpisah dari project lain.
+- **Punya satu auth schema** (`auth.users` table) yang isolated. User di project A tidak ada di project B.
+- **Punya satu Storage backend** dengan bucket-bucket yang bucket name namespace-nya per project.
+- **Punya satu region**. Tidak bisa multi-region per project (read replica di Pro plan opsi limited).
+- **Punya satu API URL**: `https://<project-ref>.supabase.co`.
+- **Punya satu set API key**: anon key (atau publishable key), service_role key (atau secret key).
+
+Implikasi: cross-project query, cross-project auth, cross-project realtime tidak ada native support. Workspace multi-tenant biasanya bikin per organization, bukan per project.
+
+### Project ref
+
+Tiap project punya ID unik 20-char (mis. `abcdefghijklmnopqrst`). Disebut "project ref" atau "project ID". Muncul di:
+
+- URL: `https://<project-ref>.supabase.co`
+- CLI `supabase link --project-ref <ref>`
+- Dashboard URL
+- Webhook callback URL
+
+Jangan bingung dengan "project name" (display label) yang bebas kamu ubah.
+
+### Project compute size
+
+Default Free plan: micro compute (shared resource). Pro plan: small compute dedicated. Add-on untuk medium, large, XL, dst.
+
+Compute affect: query latency, concurrent connection limit, RAM untuk index, build time HNSW index, throughput.
+
+Scale up via Dashboard > Project Settings > Compute. Project restart saat scale (downtime detik-an).
+
+## Organization
+
+Organisasi adalah wadah billing dan team member:
+
+- **Billing scope**: invoice issued per organization, bukan per project. Project Free dan Pro di organization yang sama digabungin invoice.
+- **Member management**: invite user ke organization, set role (owner, admin, developer, read-only).
+- **SSO setup**: untuk Enterprise plan, SSO di-config di level organization.
+- **Audit log**: aktivitas member dan project tracked per organization.
+
+User bisa anggota di banyak organization. Project tidak bisa transfer antar organization (perlu kontak support).
+
+## Environment strategy
+
+Supabase tidak punya konsep "environment" built-in seperti Heroku (production / staging / review app). Yang ada:
+
+- **Local stack**: jalan via `supabase start`, mirror service production.
+- **Branch project (Pro plan)**: preview database per git branch, auto-create saat PR open, auto-delete saat PR close.
+- **Production project**: project utama yang user beneran hit.
+
+### Pattern 1: Local + Production (paling simple)
+
+Dev di lokal pakai `supabase start`. Push migrasi ke production project via `supabase db push`.
+
+Cocok untuk: solo developer, MVP, project kecil.
+
+Trade-off: tidak ada staging yang share data dengan production. Bug yang muncul cuma dengan data production sulit reproduce di lokal.
+
+### Pattern 2: Local + Staging + Production
+
+Dua project Supabase terpisah: staging dan production. Migrasi push ke staging dulu untuk verify, lalu ke production.
+
+```bash
+# Link ke staging
+supabase link --project-ref <staging-ref>
+supabase db push
+
+# Test di staging environment
+
+# Link ke production
+supabase link --project-ref <prod-ref>
+supabase db push
+```
+
+Cocok untuk: team kecil-menengah, ada user real di production.
+
+Trade-off: dua project = dua Postgres instance = dua billing. Free plan limit project per organization (sekitar 2 project free).
+
+### Pattern 3: Branch project per PR (Pro plan)
+
+Setiap PR auto-create branch project (DB clone schema dari production). Migrasi di branch test-able tanpa polusi staging.
+
+Setup di Dashboard > Branching. Auto-trigger saat PR open lewat GitHub integration.
+
+Cocok untuk: team dengan banyak PR concurrent.
+
+Trade-off: butuh Pro plan, butuh GitHub integration setup.
+
+## Region selection
+
+Region pilih saat create project, tidak bisa diubah setelahnya (perlu create project baru + migrate data).
+
+Region available (per 2026):
+
+- US East (Virginia)
+- US West (Oregon)
+- EU West (Ireland, London)
+- EU Central (Frankfurt)
+- Asia Northeast (Tokyo)
+- Asia Southeast (Singapore)
+- Asia South (Mumbai)
+- South America (São Paulo)
+- Australia (Sydney)
+
+Untuk audience Indonesia: **Singapore (ap-southeast-1)** rekomendasi default. Latency typical 30-80ms dari Jakarta. Lebih rendah dari Tokyo (~120ms) atau US East (~250ms).
+
+Cek region list update di Dashboard atau [supabase.com/docs/guides/platform/regions](https://supabase.com/docs/guides/platform/regions).
+
+## API URL dan kredensial
+
+Tiap project punya endpoint yang muncul saat `supabase status` (lokal) atau Dashboard > Project Settings > API (production):
+
+```
+API URL:        https://<ref>.supabase.co
+DB URL:         postgresql://postgres:<pwd>@db.<ref>.supabase.co:5432/postgres
+GraphQL URL:    https://<ref>.supabase.co/graphql/v1
+Studio URL:     https://supabase.com/dashboard/project/<ref>
+```
+
+Public key (anon atau publishable):
+
+- Aman di-bundle ke frontend.
+- Per-row authorization via RLS yang protect data.
+- Bisa rotate kalau pakai key baru (`sb_publishable_...`).
+
+Secret key (service_role atau new sb_secret_):
+
+- Bypass RLS, full DB access.
+- NEVER ke client / `NEXT_PUBLIC_*` env / browser.
+- Cuma di server-only context (Server Action, Edge Function, admin script).
+
+### Anon (legacy) vs Publishable (new)
+
+Juli 2025 Supabase launch sistem key baru. Detail di [Tools / Overview](/id/supabase/tools#catatan-nama-key-anon-vs-publishable). Singkat: format JWT lama (anon, service_role) ke format opaque baru (sb_publishable, sb_secret), bisa di-rotate dan revoke. Legacy key tetap jalan sampai akhir 2026.
+
+## Project setting penting
+
+Bagian Dashboard > Project Settings yang perlu visit sekali setup:
+
+- **API**: dapatkan key, lihat URL.
+- **Database**: connection string, password reset, compute scale.
+- **Auth**: SMTP setup (sebelum kirim invite production), provider OAuth config.
+- **Storage**: S3 protocol credential (kalau mau pakai aws-cli).
+- **Edge Functions**: secret manager, domain setup.
+- **Backup**: schedule restore (Pro+), point-in-time recovery setting.
+- **Custom domain**: setup `api.example.com` mapping (Pro+).
+
+## Multi-tenant strategy
+
+Untuk SaaS yang punya banyak tenant (workspace, organization end-user), pertanyaan: satu project Supabase shared semua tenant, atau project per tenant?
+
+### Pendekatan 1: Shared project + tenant_id column
+
+Semua tenant pakai project yang sama. Tabel app punya kolom `org_id` atau `tenant_id`. RLS filter berdasarkan kolom itu via [multi-tenant pattern](/id/supabase/services/database#pattern-3-multi-tenant-via-membership-table).
+
+Pros: simple operasi, satu Postgres, satu billing.
+Cons: noisy neighbor risk (query tenant besar bikin lambat tenant kecil), data co-mingled.
+
+Cocok untuk: SaaS dengan banyak tenant kecil yang load mirip.
+
+### Pendekatan 2: Project per tenant
+
+Tiap tenant project Supabase sendiri. Provisioning automated lewat Management API.
+
+Pros: data isolation kuat, compute per tenant terpisah, billing transparan.
+Cons: management overhead, deploy migrasi ke ratusan project, biaya minimum per project.
+
+Cocok untuk: enterprise SaaS yang tenant punya compliance ketat, atau tenant load sangat bervariasi.
+
+Banyak SaaS pilih pendekatan 1 sampai tenant terbesar mulai noisy, lalu migrate tenant besar ke project dedicated.
+
+## Migrating data antar project
+
+Kasus typical: setup project lokal lama, mau pindah ke project Supabase production baru.
+
+Workflow:
+
+```bash
+# 1. Dump schema dari project lama
+supabase db dump --schema public > schema.sql
+
+# 2. Dump data
+supabase db dump --data-only > data.sql
+
+# 3. Link ke project baru
+supabase link --project-ref <new-ref>
+
+# 4. Apply ke project baru
+psql "$NEW_DB_URL" < schema.sql
+psql "$NEW_DB_URL" < data.sql
+
+# 5. Restart Realtime dan Storage kalau perlu
+```
+
+Untuk data Storage, pakai aws-cli S3 protocol:
+
+```bash
+aws --endpoint-url <old-storage-endpoint> s3 sync s3://<bucket> ./tmp
+aws --endpoint-url <new-storage-endpoint> s3 sync ./tmp s3://<bucket>
+```
+
+Auth user pindah lebih tricky (password hash format). Lewat Management API atau service_role bulk insert ke `auth.users`. Detail di [Auth service](/id/supabase/services/auth).
+
+## Setelah ini
+
+- Setup CLI dan local stack: [Tools / Install](/id/supabase/tools)
+- Detail billing per service: [Billing](/id/supabase/foundation/billing)
+- Istilah Supabase: [Glossary](/id/supabase/foundation/glossary)
+- Service-by-service deep page: [Service Reference](/id/supabase/services)

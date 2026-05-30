@@ -1,0 +1,445 @@
+# Database (Postgres)
+
+**TL;DR**: Managed Postgres 17 dengan ekstensi pilihan, plus auto REST API (PostgREST) + GraphQL (pg_graphql) yang generate langsung dari schema. `auth.users` built-in, tinggal foreign key. RLS jadi mekanisme isolasi data default, bukan add-on.
+
+**Analogi**: AWS RDS Postgres atau GCP Cloud SQL, tapi dengan tiga perbedaan struktural: auto REST/GraphQL gratis, auth schema built-in, dan pgvector/pgmq tersedia tanpa setup tambahan.
+
+## Perfect use-case
+
+- Aplikasi B2C dengan relational data (notes app, task tracker, social feed, e-commerce dengan order/inventory)
+- B2B SaaS multi-tenant pakai pattern membership table (organization + members) dengan RLS
+- RAG dan semantic search via pgvector (embedding di table biasa, query pakai operator `<->`)
+- Background job queue via pgmq (lebih simple dari Redis + worker untuk volume kecil-menengah)
+- Cron job di-trigger pgmq + pg_cron (mis. cleanup task, daily aggregation)
+- REST API CRUD tanpa coding endpoint manual
+
+## Anti use-case
+
+- Global multi-region write (Supabase single-region per project, read replica baru opsi limited di Pro). Untuk write multi-region butuh Spanner / CockroachDB.
+- Heavy OLAP workload (sum/group by jutaan row tiap jam). Postgres bisa tapi mahal. ClickHouse / BigQuery / DuckDB lebih cocok.
+- Sub-50ms latency global consistent. Project free tier bisa pause setelah idle 7 hari, cold start ~5 detik.
+- Data warehouse dengan dimensi lebar (1000+ kolom). Postgres jalan tapi performance turun. Kolom-oriented store lebih cocok.
+
+## Pricing mental model
+
+Yang naik bill:
+
+| Dimensi | Free | Pro $25/mo | Beyond Pro |
+|---|---|---|---|
+| Storage | 500 MB | 8 GB | $0.125/GB |
+| Bandwidth keluar | 5 GB | 250 GB | $0.09/GB |
+| Compute (CPU/RAM) | Shared micro | Shared small | Add-on $60+/mo |
+| Read replica | tidak | tidak | Add-on (region-bound) |
+| Backup retention | 1 hari point-in-time | 7 hari | Add-on untuk lebih panjang |
+| Multi-AZ HA | tidak | tidak | Add-on |
+
+Lebih banyak proyek hit limit di **bandwidth + compute**, jarang di storage. Query yang scan full table tiap detik akan exhaust shared compute. Pakai index dan caching dulu sebelum upgrade compute add-on.
+
+## Local emulator
+
+Postgres 17 jalan via `supabase start`, port 54322. Connect:
+
+```bash
+psql postgresql://postgres:postgres@127.0.0.1:54322/postgres
+```
+
+Atau pakai client GUI (TablePlus, Beekeeper Studio, DBeaver) ke host `127.0.0.1:54322`, user `postgres`, password `postgres`.
+
+Detail setup di [Tools/Local Stack](/id/supabase/tools/local-stack).
+
+## Hello-world
+
+Table + insert + select:
+
+```sql
+create table todos (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid references auth.users(id) on delete cascade,
+  content text not null,
+  done boolean default false,
+  created_at timestamptz default now()
+);
+
+alter table todos enable row level security;
+
+create policy "users see own todos"
+  on todos for select to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "users modify own todos"
+  on todos for all to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
+
+-- Insert pakai service_role (bypass RLS) untuk seed
+insert into todos (user_id, content) values
+  ((select id from auth.users limit 1), 'beli kopi');
+```
+
+Setelah ini, dari aplikasi pakai supabase-js, `select * from todos` otomatis cuma return baris milik user yang login. Lihat [S1 journey](/id/supabase/journeys/s1-auth-crud) untuk end-to-end app pakai pattern ini.
+
+## Ekstensi
+
+Postgres 17 di Supabase dapat puluhan ekstensi. Beberapa enabled by default, sisanya tinggal `create extension`.
+
+### Default enabled
+
+| Ekstensi | Fungsi |
+|---|---|
+| `pgcrypto` | gen_random_uuid(), hash, encrypt |
+| `uuid-ossp` | UUID generator alternative |
+| `pg_graphql` | auto GraphQL endpoint di `/graphql/v1` |
+| `pg_stat_statements` | track query performance untuk Studio Reports |
+| `supabase_vault` | secret manager dalam DB |
+
+### Sering di-enable
+
+| Ekstensi | Fungsi | Enable |
+|---|---|---|
+| `vector` (pgvector) | embedding + similarity search untuk RAG | `create extension vector with schema extensions` |
+| `pgmq` | message queue dalam DB | `create extension pgmq` |
+| `pg_cron` | scheduled job dalam DB | `create extension pg_cron` |
+| `pg_net` | HTTP request dari SQL function | `create extension pg_net` |
+| `hstore` | key-value column type | `create extension hstore` |
+| `pgaudit` | audit log untuk compliance | `create extension pgaudit` |
+| `pg_jsonschema` | validasi JSON schema di kolom JSONB | `create extension pg_jsonschema` |
+| `postgis` | geospatial (point, polygon, distance) | `create extension postgis` |
+| `pgsodium` | encryption helper (sealed secret) | `create extension pgsodium` |
+
+Enable juga bisa lewat Studio: Database > Extensions > toggle.
+
+### Workflow contoh: RAG pakai pgvector + pgmq + pg_cron
+
+Kombinasi tiga ekstensi yang sering muncul:
+
+```sql
+-- Enable
+create extension if not exists vector;
+create extension if not exists pgmq;
+create extension if not exists pg_cron;
+create extension if not exists pg_net;
+
+-- Bikin queue untuk embedding job
+select pgmq.create('embedding_queue');
+
+-- Table dokumen
+create table documents (
+  id uuid primary key default gen_random_uuid(),
+  content text,
+  embedding vector(1536)  -- OpenAI ada-002 dimension
+);
+
+-- Trigger: tiap insert document, enqueue job embedding
+create or replace function enqueue_embedding() returns trigger as $$
+begin
+  perform pgmq.send('embedding_queue', json_build_object('id', new.id, 'content', new.content));
+  return new;
+end;
+$$ language plpgsql;
+
+create trigger after_insert_document
+  after insert on documents
+  for each row execute function enqueue_embedding();
+
+-- Cron job: tiap menit, drain queue, call OpenAI, update embedding
+-- (logic detail di RAG journey nanti)
+select cron.schedule('process-embeddings', '* * * * *', $$
+  -- pseudocode: ambil dari pgmq, call OpenAI via pg_net, update documents
+$$);
+```
+
+Detail step-by-step ada di **S5 RAG journey** (work in progress).
+
+## RLS pattern library
+
+Empat pattern paling umum. Tiap pattern punya skenario, schema, dan policy lengkap. Cara track policy ini sebagai migrasi + test pakai pgTAP: [RLS Workflow](/id/supabase/tools/rls-workflow).
+
+### Pattern 1: Own data (single-tenant per user)
+
+**Skenario**: notes app, todo, profil. Setiap user cuma akses data miliknya.
+
+**Schema**:
+
+```sql
+create table notes (
+  id uuid primary key default gen_random_uuid(),
+  user_id uuid not null references auth.users(id) on delete cascade,
+  content text not null,
+  created_at timestamptz default now()
+);
+create index notes_user_id_idx on notes(user_id);
+alter table notes enable row level security;
+```
+
+**Policies**:
+
+```sql
+create policy "select own" on notes for select to authenticated
+  using ((select auth.uid()) = user_id);
+
+create policy "insert own" on notes for insert to authenticated
+  with check ((select auth.uid()) = user_id);
+
+create policy "update own" on notes for update to authenticated
+  using ((select auth.uid()) = user_id)
+  with check ((select auth.uid()) = user_id);
+
+create policy "delete own" on notes for delete to authenticated
+  using ((select auth.uid()) = user_id);
+```
+
+Detail end-to-end di [S1 Auth + CRUD](/id/supabase/journeys/s1-auth-crud).
+
+### Pattern 2: Public read, owner write
+
+**Skenario**: blog post, public profile. Siapa pun baca, cuma author yang modify.
+
+**Schema**:
+
+```sql
+create table posts (
+  id uuid primary key default gen_random_uuid(),
+  author_id uuid not null references auth.users(id),
+  title text not null,
+  body text,
+  is_published boolean default false,
+  created_at timestamptz default now()
+);
+create index posts_author_id_idx on posts(author_id);
+alter table posts enable row level security;
+```
+
+**Policies**:
+
+```sql
+-- Public bisa baca yang published, author bisa baca semua (termasuk draft)
+create policy "public read published" on posts for select
+  using (is_published = true);
+
+create policy "author read own draft" on posts for select to authenticated
+  using ((select auth.uid()) = author_id);
+
+create policy "author insert" on posts for insert to authenticated
+  with check ((select auth.uid()) = author_id);
+
+create policy "author update own" on posts for update to authenticated
+  using ((select auth.uid()) = author_id)
+  with check ((select auth.uid()) = author_id);
+
+create policy "author delete own" on posts for delete to authenticated
+  using ((select auth.uid()) = author_id);
+```
+
+Catatan: dua policy SELECT untuk "public read" dan "author read own draft" digabung Postgres pakai OR. Author lihat semua post miliknya, public cuma lihat published.
+
+### Pattern 3: Multi-tenant via membership table
+
+**Skenario**: SaaS dengan workspace/organization. User adalah member dari satu atau lebih org, akses data org berdasarkan role di membership.
+
+**Schema**:
+
+```sql
+create table organizations (
+  id uuid primary key default gen_random_uuid(),
+  name text not null,
+  created_at timestamptz default now()
+);
+
+create type org_role as enum ('owner', 'admin', 'member');
+
+create table org_members (
+  org_id uuid not null references organizations(id) on delete cascade,
+  user_id uuid not null references auth.users(id) on delete cascade,
+  role org_role not null default 'member',
+  joined_at timestamptz default now(),
+  primary key (org_id, user_id)
+);
+create index org_members_user_id_idx on org_members(user_id);
+
+create table projects (
+  id uuid primary key default gen_random_uuid(),
+  org_id uuid not null references organizations(id) on delete cascade,
+  name text not null,
+  created_at timestamptz default now()
+);
+create index projects_org_id_idx on projects(org_id);
+
+alter table organizations enable row level security;
+alter table org_members enable row level security;
+alter table projects enable row level security;
+```
+
+**Helper function (SECURITY DEFINER untuk hindari RLS recursion)**:
+
+```sql
+create schema if not exists private;
+
+create or replace function private.get_user_org_role(p_org_id uuid, p_user_id uuid)
+returns org_role
+set search_path = ''
+as $$
+  select role from public.org_members
+  where org_id = p_org_id and user_id = p_user_id;
+$$ language sql security definer stable;
+```
+
+**Policies**:
+
+```sql
+-- Organizations: member bisa baca org-nya, owner bisa modify
+create policy "member read org" on organizations for select to authenticated
+  using (private.get_user_org_role(id, (select auth.uid())) is not null);
+
+create policy "owner manage org" on organizations for all to authenticated
+  using (private.get_user_org_role(id, (select auth.uid())) = 'owner');
+
+-- Members: member bisa lihat sesama member, admin/owner bisa manage
+create policy "member read members" on org_members for select to authenticated
+  using (private.get_user_org_role(org_id, (select auth.uid())) is not null);
+
+create policy "admin manage members" on org_members for all to authenticated
+  using (private.get_user_org_role(org_id, (select auth.uid())) in ('owner', 'admin'));
+
+-- Projects: semua member baca, admin+ modify
+create policy "member read projects" on projects for select to authenticated
+  using (private.get_user_org_role(org_id, (select auth.uid())) is not null);
+
+create policy "admin modify projects" on projects for all to authenticated
+  using (private.get_user_org_role(org_id, (select auth.uid())) in ('owner', 'admin'));
+```
+
+**Kenapa SECURITY DEFINER**: kalau policy `org_members` query `org_members` lagi untuk cek role, infinite recursion. SECURITY DEFINER bypass RLS saat function jalan, langsung query tabel. Pasang di schema `private` yang tidak di-expose PostgREST supaya tidak callable dari client.
+
+### Pattern 4: RBAC via custom claim di JWT
+
+**Skenario**: aplikasi punya role global (admin, support, user). Mau cek di policy tanpa query tabel tiap kali.
+
+**Setup**: pakai Supabase auth hook (Custom Access Token Hook) untuk inject claim ke JWT saat login.
+
+```sql
+create or replace function public.add_user_role_to_jwt(event jsonb)
+returns jsonb
+set search_path = ''
+as $$
+declare
+  user_role text;
+begin
+  select role into user_role from public.user_roles
+  where user_id = (event->>'user_id')::uuid;
+
+  return jsonb_set(event, '{claims,user_role}', to_jsonb(coalesce(user_role, 'user')));
+end;
+$$ language plpgsql security definer;
+
+-- Setup hook di Dashboard atau via config.toml
+```
+
+**Policy**:
+
+```sql
+create policy "admin sees all logs" on audit_logs for select to authenticated
+  using ((auth.jwt() ->> 'user_role') = 'admin');
+
+create policy "support reads tickets" on support_tickets for select to authenticated
+  using ((auth.jwt() ->> 'user_role') in ('admin', 'support'));
+```
+
+**Kapan dipakai**: kalau policy kompleks dan butuh role check di banyak tabel. Custom claim hemat satu join per query. Trade-off: claim cuma update saat user re-login, jadi role change baru efektif setelah session refresh.
+
+## Index strategy untuk RLS performance
+
+RLS evaluate per row. Tanpa index, policy `using (user_id = auth.uid())` jadi sequential scan di table besar. Aturan main:
+
+1. **Kolom yang dipakai di policy harus di-index**. Untuk `using ((select auth.uid()) = user_id)`, butuh `create index ... on table(user_id)`.
+
+2. **Bungkus function call pakai subquery**. `(select auth.uid())` instead of `auth.uid()`. Postgres cache hasil subquery per query, bukan per row. Speedup signifikan di table besar.
+
+3. **Hindari JOIN di policy**. Kalau perlu lookup ke tabel lain, pakai SECURITY DEFINER function yang return scalar (kayak Pattern 3). Function call lebih murah daripada repeated JOIN per row.
+
+4. **Composite index untuk multi-tenant**. Untuk `where org_id = ? and user_id = ?`, bikin `create index ... on org_members(user_id, org_id)`. Postgres bisa pakai leftmost prefix.
+
+5. **EXPLAIN ANALYZE saat query lambat**. Jalankan `explain analyze select * from notes` setelah login sebagai user. Liat apakah pakai index scan atau seq scan. Kalau seq scan, fix index.
+
+## Schema convention
+
+Supabase punya beberapa schema dengan tugas spesifik. Penting tahu mana yang boleh sentuh:
+
+| Schema | Tugas | Boleh ubah? |
+|---|---|---|
+| `public` | tempat tabel aplikasi kamu | ya, mainan utama |
+| `auth` | user, session, OAuth provider | tidak, dikelola GoTrue |
+| `storage` | bucket metadata, file path | tidak, dikelola Storage API |
+| `realtime` | replication slot, subscription | tidak, dikelola Realtime |
+| `extensions` | extension yang butuh schema (vector, dll) | tidak langsung, install ekstensi ke sini |
+| `private` (convention) | helper function SECURITY DEFINER | ya, bikin sendiri |
+| `vault` | secret encrypted (supabase_vault) | indirect, lewat API |
+
+Catatan: schema `private` (atau `internal`) cuma convention nama, kamu bikin sendiri lewat `create schema`. PostgREST tidak expose schema selain `public` dan `graphql_public` default. Ekstensi schema lain di Studio Dashboard kalau perlu.
+
+## Auto REST + GraphQL
+
+Tiap table di `public` schema otomatis dapat REST endpoint via PostgREST:
+
+```
+GET    /rest/v1/notes              -- list
+GET    /rest/v1/notes?id=eq.<uuid> -- detail
+POST   /rest/v1/notes              -- insert
+PATCH  /rest/v1/notes?id=eq.<uuid> -- update
+DELETE /rest/v1/notes?id=eq.<uuid> -- delete
+```
+
+JWT dari Authorization header di-forward ke Postgres, RLS auto-enforce. Tidak perlu tulis endpoint Lambda/Express.
+
+Filter, ordering, pagination via query param:
+
+```
+GET /rest/v1/notes?content=ilike.*meeting*&order=created_at.desc&limit=10
+```
+
+Embed relasi (PostgREST auto-detect foreign key):
+
+```
+GET /rest/v1/posts?select=id,title,author:auth.users(email)
+```
+
+GraphQL endpoint via pg_graphql:
+
+```
+POST /graphql/v1
+{ "query": "{ notesCollection { edges { node { id content } } } }" }
+```
+
+GraphQL auto-update kalau schema berubah, tanpa codegen manual.
+
+## Gotcha
+
+- **Lupa enable RLS**: `alter table ... enable row level security` wajib. Policy ditulis tanpa baris ini = inactive. Default Postgres = RLS off.
+- **`postgres` role bypass RLS**: query dari `psql` sebagai user `postgres` (default lokal) tidak lewat RLS. Test policy via Studio SQL editor dengan **impersonate user** atau dari app yang sudah login.
+- **SECURITY DEFINER yang tidak `set search_path = ''`**: kalau search_path tidak di-fix, attacker bisa shadow function dengan object di schema mereka, eksekusi arbitrary SQL. Selalu pakai `set search_path = ''` di SECURITY DEFINER.
+- **JWT expired silent**: kalau Next.js middleware tidak setup, JWT expire di tengah session. Lihat pattern di [S1 Step 4](/id/supabase/journeys/s1-auth-crud#step-4-middleware-untuk-refresh-session).
+- **PostgREST tidak expose schema selain public**: kalau bikin schema lain (mis. `internal`), table di sana tidak di-REST. Fitur, bukan bug. Hindari accidental expose data internal.
+- **Migration urut by timestamp**: jangan rename file migrasi yang sudah pernah push. CLI track berdasarkan filename, rename = re-apply atau conflict.
+- **Read replica baru opsi limited**: di Pro plan, read replica bisa tapi cuma untuk region tertentu dan ada delay. Jangan asumsi global read scaling default.
+- **Postgres pause di Free tier**: project free pause setelah 7 hari idle. Cold start saat first request ~5 detik. Pro tidak pause.
+
+## Cross-provider
+
+| Capability | Supabase | AWS | Azure | GCP | Oracle |
+|---|---|---|---|---|---|
+| Managed Postgres | Database | RDS PG / Aurora PG | DB for PG | Cloud SQL PG | Autonomous DB (PG-compat) |
+| Per-row security | RLS native | RLS Postgres + IAM auth | RLS native | RLS native | RLS native |
+| Auto REST API | PostgREST bundled | tidak (pakai API GW + Lambda) | tidak | tidak | tidak (REST Data Service partial) |
+| Auto GraphQL | pg_graphql bundled | AppSync (managed, beda model) | tidak | tidak | tidak |
+| Auth schema | auth.users built-in | Cognito (terpisah, integrasi manual) | Entra ID B2C (terpisah) | Identity Platform (terpisah) | IDCS (terpisah) |
+| Vector search | pgvector bundled | RDS Postgres + manual pgvector / OpenSearch / Bedrock KB | AI Search vector / pgvector di Azure DB | Vertex Vector / pgvector | pgvector self-managed |
+| Job queue | pgmq | SQS terpisah | Service Bus terpisah | Pub/Sub terpisah | Streaming terpisah |
+| Cron in DB | pg_cron | EventBridge + Lambda | Logic Apps timer | Cloud Scheduler | Scheduler service |
+| Connection pooler | Supavisor / PgBouncer | RDS Proxy | PG built-in | Cloud SQL Proxy | DB tools |
+
+Positioning Supabase: paling tight integration antara DB dan service di sekelilingnya. AWS RDS lebih flexible tapi butuh wiring banyak service terpisah. Untuk app yang fit pola "Postgres + RLS + REST/GraphQL + Vector + Queue dalam satu project", Supabase paling rendah friction. Untuk skenario enterprise yang non-standard (multi-account, cross-region active-active, compliance regulator spesifik), AWS lebih mature.
+
+## Setelah ini
+
+- Pakai pattern RLS di journey: [S1 Auth + CRUD](/id/supabase/journeys/s1-auth-crud)
+- Migration workflow detail: [Tools/Workflow](/id/supabase/tools/workflow)
+- Service lain yang terhubung ke Database: **Auth** (auth.users), **Realtime** (Postgres CDC), **Edge Function** (call SQL dari Deno). Halaman dedicated work in progress.

@@ -1,0 +1,448 @@
+# Realtime
+
+**TL;DR**: Server WebSocket bundled di Supabase yang gabungin tiga mode: Postgres Changes (replication slot ke push CDC event), Broadcast (pub/sub ephemeral), dan Presence (state online sync). Satu channel bisa multiplex semua tiga.
+
+**Analogi**: Pusher atau Ably plus DynamoDB Streams plus AppSync subscription, jadi satu service. Khusus mode Postgres Changes: tail replication slot Postgres native, jadi event push otomatis tanpa kamu code "kirim notif manual".
+
+## Perfect use-case
+
+- Chat app: message persist di DB + push real-time + typing indicator + online list (gabungan tiga mode)
+- Live dashboard: metric berubah di Postgres = chart update di browser tanpa polling
+- Collaborative editing: cursor position via Broadcast, lock per resource via Presence
+- Multiplayer game state: posisi pemain Broadcast ephemeral, score persist Postgres Changes
+- Live notification: insert ke `notifications` table = user yang affected dapat push
+- Live audit: streaming log akses ke admin dashboard
+
+## Anti use-case
+
+- Event throughput sangat tinggi (di atas 10K event per detik) yang semua mau persist. Replication slot saturasi. Pakai Broadcast murni atau queue terpisah.
+- Latency super-low global (sub-50ms) konsisten. Realtime server di region project, latency baseline 100-200ms ke audience global.
+- Acknowledgment delivery guarantee (exactly-once, ordered). Realtime adalah pub/sub fire-and-forget. Untuk reliable delivery, pakai queue (pgmq, SQS).
+- Message history seach over time. Realtime push event saat terjadi. Untuk audit query history, simpan di table biasa, query lewat SQL.
+
+## Pricing mental model
+
+| Dimensi | Free | Pro | Beyond |
+|---|---|---|---|
+| Concurrent peak connections | 200 | 500 | add-on |
+| Messages per bulan (event) | 2 juta | 5 juta | $2.5/M |
+| Channel | unlimited | unlimited | unlimited |
+| Presence sync | hitung di Messages | hitung di Messages | sama |
+| WebSocket connection duration | unlimited | unlimited | unlimited |
+
+Yang sering miss:
+
+- **Presence sync hitung di Messages**: user join/leave channel = sync event ke semua subscriber. 100 user di channel = 100 sync per event ke semua = 10K event sekali. Channel ramai cepat habis quota.
+- **Filter postgres_changes di server**: filter `filter: room_id=eq.<id>` di-evaluate Realtime server. Event yang tidak match tetap counted di replication slot consumption, tapi tidak dikirim sebagai message ke client.
+- **WebSocket idle pakai connection slot**: meski tidak ada event, connection live = pakai slot. App dengan banyak user passive (buka tab tapi tidak aktif) bisa hit limit connection.
+
+## Local emulator
+
+Realtime container default jalan via `supabase start`. Endpoint:
+
+```
+ws://127.0.0.1:54321/realtime/v1/websocket
+```
+
+Tidak perlu setup eksternal. Detail di [Tools / Local Stack](/id/supabase/tools/local-stack).
+
+## Hello-world
+
+Subscribe Postgres Changes (table `notes`):
+
+```ts
+import { createClient } from '@supabase/supabase-js'
+
+const supabase = createClient(url, anonKey)
+
+const channel = supabase
+  .channel('notes-changes')
+  .on(
+    'postgres_changes',
+    {
+      event: 'INSERT',
+      schema: 'public',
+      table: 'notes'
+    },
+    (payload) => console.log('new note:', payload.new)
+  )
+  .subscribe()
+```
+
+Sebelum subscribe punya efek, table `notes` perlu masuk publication `supabase_realtime` (lihat section di bawah).
+
+Full pattern dengan tiga mode di [S3 journey](/id/supabase/journeys/s3-realtime).
+
+## Mode 1: Postgres Changes
+
+Subscribe ke INSERT/UPDATE/DELETE pada table Postgres. Realtime server tail replication slot, push event ke client yang subscribed.
+
+### Enable replication
+
+Table harus masuk publication `supabase_realtime`:
+
+```sql
+alter publication supabase_realtime add table notes;
+```
+
+Hanya table yang **butuh** di-realtime yang dimasukin. Audit log internal yang tidak perlu broadcast jangan dimasukin, hemat replication slot consumption.
+
+### Filter server-side
+
+Filter di parameter, di-evaluate Realtime server sebelum push ke client:
+
+```ts
+.on('postgres_changes', {
+  event: 'INSERT',
+  schema: 'public',
+  table: 'messages',
+  filter: `room_id=eq.${roomId}`
+}, handler)
+```
+
+Limit kompleksitas filter:
+
+- `eq`, `neq`, `gt`, `lt`, `gte`, `lte`, `in` : supported
+- `or`, `and` complex : tidak supported di filter parameter. Terima semua dan filter di client.
+
+### Event types
+
+- `INSERT` : row baru
+- `UPDATE` : row update
+- `DELETE` : row dihapus
+- `*` : semua di atas
+
+Payload:
+
+```ts
+{
+  schema: 'public',
+  table: 'notes',
+  eventType: 'INSERT',
+  new: { id: '...', content: '...' },
+  old: null,        // null untuk INSERT
+  commit_timestamp: '2026-05-29T...'
+}
+```
+
+UPDATE: `old` berisi row lama, `new` row baru. DELETE: `old` berisi row lama, `new` null.
+
+### RLS interaction
+
+Postgres Changes respect RLS. User yang SELECT policy-nya tidak match row = tidak dapat event INSERT/UPDATE/DELETE untuk row itu.
+
+Pattern: kalau row baru insert dengan `user_id = X`, user lain (user_id != X) tidak dapat event walau subscribe channel sama. Filter otomatis di replication slot consumer level.
+
+Penting: untuk RLS apply, user harus authenticated via Supabase session. Channel di-subscribe dengan JWT user, replication slot consumer extract user dari JWT, eval policy per event.
+
+### Replikasi REPLICA IDENTITY
+
+Default REPLICA IDENTITY = DEFAULT (primary key only). UPDATE event-nya cuma include kolom yang berubah + PK. Untuk dapat semua kolom (full row) di `old`:
+
+```sql
+alter table notes replica identity full;
+```
+
+Trade-off: WAL size lebih besar, replication slot consumption naik. Pakai cuma kalau butuh.
+
+## Mode 2: Broadcast
+
+Pub/sub ephemeral antar client. Sender publish ke channel, semua subscriber dapat. Tidak persist, tidak hit DB.
+
+```ts
+// Sender
+channel.send({
+  type: 'broadcast',
+  event: 'typing',
+  payload: { user_id: 'abc', timestamp: Date.now() }
+})
+
+// Receiver
+channel.on('broadcast', { event: 'typing' }, ({ payload }) => {
+  console.log(payload.user_id, 'sedang mengetik')
+})
+```
+
+### Broadcast dari database (trigger)
+
+Bisa juga broadcast dari Postgres tanpa simpan event ke table:
+
+```sql
+create or replace function broadcast_event() returns trigger
+language plpgsql security definer
+set search_path = ''
+as $$
+begin
+  perform realtime.broadcast_changes(
+    'topic:' || new.room_id::text,    -- channel topic
+    'new_message',                     -- event name
+    'INSERT',                          -- operation
+    'messages',                        -- table
+    'public',                          -- schema
+    new,                               -- new record
+    null                               -- old record
+  );
+  return new;
+end;
+$$;
+
+create trigger after_insert_message
+  after insert on messages
+  for each row execute function broadcast_event();
+```
+
+Manfaat: lebih cepat dari Postgres Changes (skip replication slot), payload bisa custom format. Trade-off: bypass RLS, kamu manage authorization di trigger.
+
+### Receive only flag
+
+Broadcast tidak echo balik ke sender by default. Untuk receive event yang dikirim sender sendiri:
+
+```ts
+const channel = supabase.channel('room', {
+  config: { broadcast: { self: true } }
+})
+```
+
+Pakai untuk: optimistic update yang juga reconfirm via broadcast (mis. confirm receipt server-side).
+
+## Mode 3: Presence
+
+Track state per-client di channel. Sync ke semua subscriber saat state berubah.
+
+```ts
+const channel = supabase.channel('room', {
+  config: { presence: { key: userId } }
+})
+
+channel
+  .on('presence', { event: 'sync' }, () => {
+    const state = channel.presenceState()
+    console.log('current state:', state)
+  })
+  .on('presence', { event: 'join' }, ({ newPresences }) => {
+    console.log('joined:', newPresences)
+  })
+  .on('presence', { event: 'leave' }, ({ leftPresences }) => {
+    console.log('left:', leftPresences)
+  })
+  .subscribe(async (status) => {
+    if (status === 'SUBSCRIBED') {
+      await channel.track({
+        user_id: userId,
+        email: userEmail,
+        online_at: new Date().toISOString()
+      })
+    }
+  })
+```
+
+### Presence state structure
+
+`presenceState()` return object dengan format:
+
+```ts
+{
+  'user-id-1': [{ user_id: 'user-id-1', email: '...', online_at: '...' }],
+  'user-id-2': [{ user_id: 'user-id-2', email: '...', online_at: '...' }]
+}
+```
+
+Tiap key (presence key) maps ke array karena satu user bisa connect dari multiple tab/device, masing-masing punya entry.
+
+### Track di SUBSCRIBED state
+
+Track HARUS dipanggil setelah subscribe konfirm:
+
+```ts
+channel.subscribe(async (status) => {
+  if (status === 'SUBSCRIBED') {
+    await channel.track({ ... })
+  }
+})
+```
+
+Track sebelum subscribed = silent no-op.
+
+### Leave detection delay
+
+Realtime detect leave lewat WebSocket heartbeat. Default interval 5-15 detik. Tab close, server tidak instant tahu, ada delay.
+
+Untuk instant leave indicator, kombinasi presence + broadcast "explicit leave":
+
+```ts
+window.addEventListener('beforeunload', () => {
+  channel.send({ type: 'broadcast', event: 'leave', payload: { user_id } })
+  channel.untrack()
+})
+```
+
+## Channel name convention
+
+Channel name unique per "topic". Dua channel name sama = state dan listener di-merge.
+
+Convention: `<resource>:<id>`.
+
+```ts
+supabase.channel(`room:${roomId}`)
+supabase.channel(`note:${noteId}`)
+supabase.channel(`document:${docId}`)
+```
+
+Hindari nama generik (`'room'`, `'chat'`) yang bisa collide.
+
+Channel name tidak ada autorisasi dari Supabase server. Client bisa subscribe channel apa saja. Authorization sebenarnya:
+
+- Postgres Changes: RLS table yang filter event.
+- Broadcast: kontrol di server-side trigger atau di-validate di sender.
+- Presence: state visible ke semua subscriber channel. Jangan track data sensitive.
+
+## Auth dan connection
+
+WebSocket pakai anon key + Authorization header berisi JWT user. Realtime server extract JWT, set context user untuk evaluate RLS Postgres Changes.
+
+Tanpa JWT (anonymous), connection masih bisa establish. Tapi:
+
+- Postgres Changes: cuma return row yang policy `to anon` match (jarang ada).
+- Broadcast: bisa publish + subscribe (RLS tidak applicable).
+- Presence: track + read state OK.
+
+Untuk app authenticated, pastikan client setup pakai SDK yang inject session:
+
+```ts
+const supabase = createClient(url, anonKey, {
+  realtime: {
+    params: { eventsPerSecond: 10 }  // rate limit per-channel
+  }
+})
+
+// JWT auto-attach saat user login via supabase.auth.signIn
+```
+
+### Rate limit per channel
+
+Default 10 event per detik per channel per client. Bisa tweak:
+
+```ts
+{
+  realtime: { params: { eventsPerSecond: 100 } }
+}
+```
+
+Hati-hati: rate limit terlalu tinggi bikin client floodable atau hit server limit.
+
+## Limit dan tuning
+
+| Limit | Default | Catatan |
+|---|---|---|
+| Channel per connection | 100 | satu WebSocket bisa multiplex banyak channel |
+| Event per detik per channel | 10 | tweak via `eventsPerSecond` |
+| Payload size per message | 256 KB | hard limit |
+| Presence key max | 100 chars | |
+| WebSocket heartbeat | 30 detik | client side |
+| Reconnect retry | exponential backoff | otomatis di SDK |
+
+### Tuning untuk skala besar
+
+- **Banyak channel per user**: kalau 1 user subscribe ke 50 channel, satu connection. OK. Kalau 1 user subscribe 500+, pertimbangkan multi-connection atau lazy subscribe per scene.
+- **Banyak user per channel**: presence sync N user = N sync event per join/leave. Untuk channel >100 user, matikan presence atau pakai sampling.
+- **High-volume broadcast**: 100 event/detik per channel di atas default rate limit. Tune `eventsPerSecond` atau batch event.
+
+## Gotcha
+
+### Subscribe + setting publication beda waktu
+
+`alter publication supabase_realtime add table notes` di-apply pas DB reset, tapi client yang sudah connect sebelumnya tidak otomatis re-subscribe. Reconnect channel setelah perubahan publication.
+
+### Filter postgres_changes tidak support OR
+
+```ts
+filter: `status=eq.active`     // OK
+filter: `status=in.(active,pending)`  // OK
+filter: `user_id=eq.X or assignee=eq.X`  // TIDAK SUPPORTED
+```
+
+Untuk OR, terima semua event lalu filter di client. Atau pisah jadi multiple channel.
+
+### Channel state global per page
+
+Subscribe channel di multiple component yang sama channel name = state share. Saat satu component unsubscribe, channel tutup, component lain putus juga.
+
+Pakai single source of truth (mis. context provider) untuk manage channel lifecycle.
+
+### Cleanup leak
+
+useEffect tanpa cleanup = channel tetap subscribed setelah navigate. WebSocket bocor, presence ghost, memory leak.
+
+```ts
+useEffect(() => {
+  const channel = supabase.channel(...)
+  channel.subscribe()
+
+  return () => {
+    supabase.removeChannel(channel)
+  }
+}, [])
+```
+
+### Browser background tab WebSocket throttling
+
+Chrome dan browser modern aggressive throttle WebSocket di background tab. User switch tab, presence bisa drop, event miss. Bukan Realtime issue, browser policy.
+
+Workaround: gunakan Service Worker untuk maintain connection (lebih kompleks), atau accept presence ghost di tab background.
+
+### `unsubscribe` vs `removeChannel`
+
+```ts
+channel.unsubscribe()      // stop listening, object masih ada
+supabase.removeChannel(channel)  // hapus full
+```
+
+Untuk React cleanup pakai `removeChannel`. `unsubscribe` cuma kalau temporary pause.
+
+### Server Component tidak bisa subscribe
+
+Realtime butuh persistent WebSocket connection. Server Component render once and done, tidak compatible. Subscribe selalu di Client Component (`'use client'`).
+
+### Replication slot fill di high volume
+
+Insert burst (mis. bulk import 100K row) sebelum Realtime sempat consume = slot makin gede, eat disk. Monitor via:
+
+```sql
+select * from pg_replication_slots where slot_name like 'supabase_realtime%';
+```
+
+Workaround: bulk insert sementara remove table dari publication, restore setelah selesai.
+
+### Presence state bisa stale
+
+Sync event ada delay. Local `presenceState()` reflect state sekitar 200ms terlambat dari realitas. Untuk UI yang harus consistent (mis. "siapa boleh edit"), pakai lock pattern eksplisit (broadcast claim/release), bukan presence sajamere.
+
+## Cross-provider
+
+| Capability | Supabase Realtime | AWS | Azure | GCP | Self-host |
+|---|---|---|---|---|---|
+| WebSocket | Realtime server (Elixir/Phoenix) | API Gateway WebSocket + Lambda | SignalR / Web PubSub | Cloud Run | Socket.io, ws, Phoenix |
+| Postgres CDC | bundled via publication | DMS, DBLog manual, Bedrock KB | Logic Apps trigger, Stream Analytics | Datastream | Debezium |
+| Pub/sub broadcast | bundled | SNS + SQS, AppSync subscriptions, IoT Core | Web PubSub, Event Grid | Pub/Sub | Redis pub/sub, NATS |
+| Presence | bundled | AppSync custom + Lambda | SignalR groups | Firestore listener | custom (Redis) |
+| Setup effort | satu API client | banyak service + IAM | beberapa service | beberapa service | self-host setup |
+| Latency typical | 50-200ms | tergantung region wiring | tergantung | tergantung | tergantung |
+| RLS-aware delivery | otomatis | tidak (filter di app) | tidak | tidak | tidak |
+
+Positioning: Realtime menang di "tiga mode di satu API". AWS perlu wire 3-4 service untuk equivalent. Untuk skala enterprise yang butuh custom WebSocket layer atau hybrid (mix protocol), Socket.io self-host atau Phoenix Channel lebih fleksibel. Untuk app start-up sampai mid-size, Realtime cukup dan jauh lebih cepat ship.
+
+## Anti-pattern
+
+- **Track presence di semua channel app**, walau bukan join screen. Bikin sync event banyak. Track cuma di screen yang user aware tentang online state.
+- **Postgres Changes untuk high-volume ephemeral event** (cursor position, scroll position). Replication slot saturasi. Pakai broadcast murni.
+- **Tidak cleanup channel di useEffect return**. WebSocket connection bocor, presence ghost, memory leak.
+- **Filter postgres_changes di client setelah terima event**. Bandwidth + cost lebih tinggi. Filter di server-side via `filter` parameter dulu.
+- **Channel name generik**: `'room'`, `'chat'`. Pakai `room:<id>` per resource.
+- **Subscribe ke `*` event saat cuma butuh INSERT**. Bandwidth + parse cost lebih tinggi. Specify event.
+- **Pakai presence sebagai source of truth lock**. State eventually consistent. Pakai broadcast claim/release untuk lock formal.
+
+## Setelah ini
+
+- End-to-end live chat journey dengan tiga mode kombinasi: [S3 journey](/id/supabase/journeys/s3-realtime)
+- Database service deep (publication, RLS pattern): [Database](/id/supabase/services/database)
+- Track RLS yang dipakai di chat schema: [RLS Workflow](/id/supabase/tools/rls-workflow)

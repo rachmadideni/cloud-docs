@@ -1,0 +1,242 @@
+# Studio
+
+**TL;DR**: Web dashboard untuk explore data, jalankan SQL, manage user auth, browse Storage bucket, monitor Edge Function log, dan tweak project setting. Lokal di port 54323, production di [supabase.com/dashboard](https://supabase.com/dashboard).
+
+**Analogi**: pgAdmin + AWS Console gabungan, dengan integrasi langsung ke semua service Supabase di project yang sama. Bukan IDE, tapi tool eksplorasi yang cepat untuk inspect-and-tweak.
+
+## Perfect use-case
+
+- Eksplorasi data: lihat row di table, filter cepat, sort, sample edit
+- SQL editor untuk ad-hoc query (debug, analytics ringan)
+- Manage user auth (lihat list, manual invite, reset password, ban)
+- Browse Storage bucket: lihat file, download, delete, set permission
+- Inspect Edge Function log live
+- Toggle ekstensi Postgres, setup auth provider, set policy via UI form
+- Run AI Assistant (Claude integration) untuk generate query atau eksplain schema
+
+## Anti use-case
+
+- Migrasi schema permanen via SQL editor. Edit di UI tidak versioned, drift dari migrasi Git. Pakai `supabase migration new` (lihat [Tools/Workflow](/id/supabase/tools/workflow)).
+- Bulk import data production. UI handle few thousand rows. Pakai `psql copy` atau dedicated ETL.
+- Code review schema atau policy. Diff yang Studio kasih bukan diff Git. Pakai PR review proper.
+- Replacement untuk tool development serius. Studio adalah inspeksi, bukan IDE. Pakai code editor + CLI untuk daily dev.
+
+## Pricing mental model
+
+Studio gratis di semua plan. Tidak ada limit usage.
+
+Trade-off implicit: setiap operasi di Studio production charge resource project. Long query di SQL editor pakai compute. Browse file ribuan di Storage cost bandwidth. Bukan billing terpisah, tapi counted.
+
+## Local emulator
+
+Studio container default jalan via `supabase start`. Buka:
+
+```
+http://127.0.0.1:54323
+```
+
+Tidak butuh login lokal. Detail container di [Tools / Local Stack](/id/supabase/tools/local-stack#service-di-balik-kong).
+
+## Hello-world
+
+`supabase start`, lalu buka browser ke `http://127.0.0.1:54323`. Sidebar list semua section. Klik Table Editor, lihat schema tables.
+
+Untuk production:
+
+1. Login [supabase.com/dashboard](https://supabase.com/dashboard).
+2. Pilih project.
+3. Sidebar tools.
+
+## Tools di dalam Studio
+
+### Table Editor
+
+Spreadsheet-like view per table. Edit cell langsung (kirim UPDATE statement di balik layar). Add/delete row. Lihat foreign key relation.
+
+Pakai untuk: eksplorasi data, manual seed, debug row spesifik. Jangan pakai untuk schema change permanent (UI generate ALTER TABLE yang tidak versioned).
+
+### SQL Editor
+
+REPL Postgres dengan history, snippet save, dan AI assistant (production). Run query, lihat result inline, export ke CSV.
+
+Snippet bisa di-save dan di-share ke team member (production). Pakai untuk: ad-hoc analytics, debug pattern, prototype query yang nanti dipindah ke migrasi.
+
+### Database
+
+Visual builder untuk:
+
+- Schema explorer dengan ERD diagram
+- Functions: list, edit, create function Postgres
+- Triggers: assign function ke event table
+- Indexes: lihat existing, create baru
+- Publications: lihat publication `supabase_realtime`, toggle table per publication
+- Extensions: toggle on/off ekstensi (vector, pgmq, pg_cron, dll) lewat UI
+
+Penting: toggle ekstensi via UI persist di project, tapi tidak otomatis masuk migrasi Git. Untuk team setting, pakai `create extension` di migrasi.
+
+### Authentication
+
+- User list dengan search, filter, sort by signup time
+- Manual invite via email
+- Force password reset
+- Ban / unban user
+- Provider config (OAuth, SMTP, JWT setting)
+- Hook setup (Custom Access Token, Password Verification, Send Email, Send SMS)
+
+Pakai untuk: support ticket (cari user, lihat status), policy compliance (audit user), setup auth provider satu-kali.
+
+### Storage
+
+- Browse bucket dan file
+- Upload via UI (kecil)
+- Set file metadata (cache control, content type)
+- Policy editor untuk `storage.objects` (visual form generate SQL policy)
+- Bucket setting (public/private, size limit, allowed MIME)
+
+### Edge Functions
+
+- List function deployed
+- Logs live tail dengan filter
+- Invocation graph (request count, latency, error rate)
+- Secret manager UI (set/unset/list)
+- Trigger function dari UI untuk testing
+
+### Realtime
+
+- Inspector channel: lihat current connection, presence state, message rate
+- Publication management (alternatif dari Database > Publications)
+- Replication slot monitor
+
+### Reports
+
+- Database performance: slow query, index hit ratio, cache hit ratio
+- API usage: request count per endpoint, error rate
+- Auth: signup rate, login rate, MAU
+- Storage: size per bucket, bandwidth
+- Edge Function: invocation count, error
+
+Pakai untuk: monitoring dan capacity planning. Trigger alert kalau ada anomaly (lewat integrasi observability terpisah).
+
+### Logs
+
+Aggregator log across service. Filter by:
+
+- Service (API gateway / DB / Auth / Storage / Functions)
+- Status code
+- Time range
+- Text search
+
+Pakai untuk: debug request yang lewat banyak service.
+
+### Settings
+
+- API keys (anon, service_role, JWT secret)
+- Database connection string
+- Backup schedule + restore
+- SMTP setup untuk auth email
+- Custom domain
+- Project pause/resume
+- Billing (production)
+
+## AI Assistant
+
+Production Studio punya AI Assistant (Claude-based) yang bisa:
+
+- Generate SQL query dari natural language
+- Explain query yang ada (apa fungsinya, kenapa lambat)
+- Generate RLS policy dari deskripsi
+- Generate Edge Function skeleton
+- Schema review (saran normalization, index, dll)
+
+Pakai untuk: starting point. Output AI tetap review dan adapt sebelum apply, bukan blanket trust.
+
+Privacy: query dan schema yang dikirim ke AI Assistant di-process di server Supabase (atau partner AI provider). Untuk project dengan data sensitif, opt-out di Settings.
+
+## Studio lokal vs production
+
+| Fitur | Lokal | Production |
+|---|---|---|
+| Table Editor | ya | ya |
+| SQL Editor | ya | ya |
+| Auth manager | ya | ya |
+| Storage browser | ya | ya |
+| Edge Function logs | terbatas (live container log) | full historical |
+| Reports | terbatas | full dengan retention |
+| AI Assistant | tidak | ya |
+| Custom domain UI | tidak | ya |
+| Billing UI | tidak | ya |
+| Backup restore | tidak | ya |
+| Team member | tidak (single user) | ya |
+| Audit log akses | tidak | ya |
+
+Lokal: untuk dev iterasi cepat. Production: untuk inspect dan manage real data.
+
+## Gotcha
+
+### Edit schema via UI tidak masuk Git
+
+Klik "Add column" di Table Editor = UI generate ALTER TABLE, apply ke DB. Tidak ada migrasi file. Drift dari repo, code review skip, rollback susah.
+
+Aturan tim: Studio production read-only untuk schema. Edit selalu via `supabase migration new` di lokal, push via `supabase db push`.
+
+Setup enforcement: Studio production akses limited ke role tertentu, atau tambah CI gate drift detection (lihat [RLS Workflow / Pattern 5](/id/supabase/tools/rls-workflow#pattern-5-ci-gate-untuk-drift-detection)).
+
+### SQL editor jalan dengan service_role (admin)
+
+Query di SQL editor bypass RLS. Test policy dengan SQL editor langsung = hasilnya nipu. Pakai "Impersonate user" feature (production) atau jalankan via app dengan login user untuk test policy nyata.
+
+Detail di [Database service / Gotcha](/id/supabase/services/database#gotcha).
+
+### Browse Storage bucket besar lambat
+
+UI Storage fetch list file dari bucket. Bucket dengan 10K+ file = response lambat, browser lag. Pakai pagination atau CLI (`supabase storage ls`) untuk bucket besar.
+
+### AI Assistant tidak deterministic
+
+Output AI bisa beda per call. Jangan pakai untuk hal kritis tanpa review manual. Untuk SQL yang reproducible, tulis manual atau pakai LLM API dengan temperature rendah (di luar Studio).
+
+### Logs retention limited
+
+Production Studio logs retain berdasarkan plan:
+
+- Free: 1 jam
+- Pro: 7 hari
+- Beyond: add-on
+
+Untuk audit panjang atau compliance, ship logs ke service eksternal (Datadog, Logtail, BetterStack).
+
+### Authentication user list expensive query
+
+Untuk project dengan jutaan user, list user UI bisa lambat dan expensive. Pakai filter agresif (search by email exact, filter signup date narrow). Atau pakai SDK / SQL langsung untuk batch operation.
+
+### Realtime inspector heavy
+
+Realtime inspector pakai resource Realtime server untuk monitor. Buka inspector di production high-traffic channel bisa add overhead. Tutup setelah selesai inspect.
+
+## Cross-provider
+
+| Capability | Supabase Studio | AWS Console | Azure Portal | GCP Console | Tools Dedicated |
+|---|---|---|---|---|---|
+| Web dashboard | bundled | bundled | bundled | bundled | pgAdmin / DBeaver |
+| Per-service UI | unified | service-by-service tab | unified | unified | DB-specific |
+| AI assistant | Claude integration | Q (preview) | Copilot | Gemini | varies |
+| Local emulator UI | ya (port 54323) | tidak (CLI mainly) | Azurite no UI | gcloud emulator no UI | pgAdmin local |
+| Custom domain UI | ya | Route53 separate | Azure DNS separate | Cloud DNS separate | tidak applicable |
+| Multi-project view | ya | ya | ya | ya | sometimes |
+| Mobile responsive | sebagian | sebagian | ya | ya | varies |
+
+Positioning: Studio menang di unified UI lintas service di satu project. AWS Console tab per service jauh lebih jeli untuk fitur per-service, tapi cognitive load berpindah antar tool tinggi. Untuk dev iterasi cepat, Studio cukup. Untuk admin senior yang manage banyak service, tab per service AWS Console.
+
+## Anti-pattern
+
+- **Edit schema production via Studio UI**: tidak versioned, drift dari Git, rollback susah. Pakai migrasi.
+- **Test RLS via SQL editor**: bypass RLS, hasilnya bohong. Pakai impersonate atau app login.
+- **Trust output AI Assistant blanket**: review sebelum apply.
+- **Bulk operation via UI**: lambat dan expensive untuk dataset besar. Pakai CLI atau script.
+- **Skip Studio production read-only policy**: team member ada yang ngedit schema langsung, drift cepat akumulasi. Lock akses by role.
+
+## Setelah ini
+
+- Migration workflow yang benar (Studio bukan satu-satunya cara): [Tools / Workflow](/id/supabase/tools/workflow)
+- CI gate untuk drift detection: [RLS Workflow / Pattern 5](/id/supabase/tools/rls-workflow#pattern-5-ci-gate-untuk-drift-detection)
+- Service deep lain: [Database](/id/supabase/services/database), [Auth](/id/supabase/services/auth), [Storage](/id/supabase/services/storage)

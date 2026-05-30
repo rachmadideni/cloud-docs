@@ -1,0 +1,281 @@
+# Billing
+
+Pricing Supabase mental model yang berlaku lintas service. Halaman ini gabungin dimensi cost dari semua page service biar bisa estimate total cost dan tahu yang sering bikin tagihan naik.
+
+> Catatan: angka spesifik bisa berubah. Halaman ini mental model, bukan source of truth pricing. Cek [supabase.com/pricing](https://supabase.com/pricing) untuk angka current.
+
+## Plan
+
+| Plan | Bulanan | Cocok untuk |
+|---|---|---|
+| Free | $0 | side project, MVP, eksplorasi |
+| Pro | $25 per organization | proyek production small-medium |
+| Team | $599 per organization | team menengah dengan SSO + audit |
+| Enterprise | custom | compliance regulator, dedicated infra |
+
+Pricing per **organization**, bukan per project. Project di organization yang sama digabungin satu invoice.
+
+### Free plan
+
+Limit gabungan:
+
+| Resource | Limit |
+|---|---|
+| Database storage | 500 MB |
+| Storage (file) | 1 GB |
+| Egress bandwidth | 5 GB/bulan |
+| Monthly Active Users | 50,000 |
+| Edge Function invocations | 500K/bulan |
+| Realtime concurrent connections | 200 |
+| Realtime messages | 2 juta/bulan |
+| Project count | 2 active per organization |
+| Pause after idle | 7 hari |
+
+Pause behavior: project tidak diakses 7 hari = auto-pause. Pertama hit setelah pause = cold start ~5 detik untuk resume.
+
+Project pause **tidak hapus data**, cuma stop compute. Setelah resume, kembali normal.
+
+### Pro plan
+
+Yang naik dari Free:
+
+| Resource | Pro |
+|---|---|
+| Database storage | 8 GB included |
+| Storage (file) | 100 GB included |
+| Egress bandwidth | 250 GB included |
+| Monthly Active Users | 100K included |
+| Edge Function invocations | 2M/bulan included |
+| Realtime concurrent connections | 500 |
+| Realtime messages | 5 juta/bulan |
+| Branch project per PR | included |
+| Email support | included |
+| Read replica | add-on |
+| HA multi-AZ | add-on |
+| Backup retention | 7 hari + PITR add-on |
+| Tidak ada auto-pause | ✅ |
+
+Plus over-limit charge per dimensi.
+
+### Team plan
+
+Tambahan dari Pro:
+
+- SSO untuk member organization
+- Audit log retention lebih panjang
+- Compliance support
+- Better SLA
+
+Tidak relevan untuk solo / project kecil.
+
+### Enterprise plan
+
+Negotiable, untuk:
+
+- Dedicated infrastructure
+- Compliance regulator spesifik (HIPAA, SOC 2 Type II)
+- Custom region atau on-prem
+- 24/7 support
+
+## Cost dimensions per service
+
+Yang naik bill, dengan tingkat impact:
+
+### Database
+
+| Dimensi | Free | Pro | Cost over |
+|---|---|---|---|
+| Storage | 500 MB | 8 GB | $0.125/GB |
+| Compute (RAM/CPU) | shared micro | shared small | add-on $60-1500/bulan |
+| Connection | 60 | 90 | tambah pooler |
+| Backup retention | 1 hari | 7 hari | add-on |
+
+Compute add-on jadi factor utama untuk app yang query heavy. Compute add-on:
+
+- Small: included Pro
+- Medium: $60/bulan
+- Large: $110/bulan
+- XL: $210/bulan
+- 2XL: $410/bulan
+- 4XL: $910/bulan
+
+Naik kalau: query lambat karena RAM kurang untuk index, banyak concurrent connection, HNSW index untuk jutaan vector.
+
+### Auth
+
+| Dimensi | Free | Pro | Cost over |
+|---|---|---|---|
+| MAU | 50K | 100K | $0.00325/MAU |
+| SMS provider | tidak include | tidak include | external (Twilio dll) |
+| OAuth provider | unlimited | unlimited | unlimited |
+| MFA factor | unlimited | unlimited | unlimited |
+
+MAU = user yang login setidaknya sekali per periode tagihan. User yang signup tapi tidak pernah login lagi tidak dihitung.
+
+SMS provider terpisah dari Supabase billing. Twilio SMS Indonesia ~$0.05-0.10 per SMS. 10K signup = $500-1000 untuk SMS saja. Pertimbangkan WhatsApp Business API atau magic link sebagai default.
+
+### Storage
+
+| Dimensi | Free | Pro | Cost over |
+|---|---|---|---|
+| Storage size | 1 GB | 100 GB | $0.021/GB-bulan |
+| Egress | 5 GB | 250 GB | $0.09/GB |
+| Image transform | unlimited | unlimited | hitung di Egress |
+
+Egress = bandwidth turun ke client. Yang sering miss: avatar 50KB diakses 10K kali/hari = 15 GB/bulan untuk satu file. Multiplied dengan banyak asset, gampang ke ratusan GB.
+
+Pasang CDN aggressive (`Cache-Control: public, max-age=31536000, immutable`) untuk asset static. CDN edge cache reduce egress origin signifikan.
+
+### Edge Functions
+
+| Dimensi | Free | Pro | Cost over |
+|---|---|---|---|
+| Invocations | 500K | 2M | $2/M |
+| CPU time | included | included | metered over-quota |
+| Egress (response) | hitung di Bandwidth | hitung di Bandwidth | sama |
+
+Yang sering miss: invocation dari DB trigger (`pg_net`) hitung sama dengan client invocation. Loop trigger yang tidak perlu = gampang habis quota.
+
+External API cost (Anthropic, OpenAI, Stripe) terpisah, billing langsung ke provider. Edge Function cuma proxy.
+
+### Realtime
+
+| Dimensi | Free | Pro | Cost over |
+|---|---|---|---|
+| Concurrent connections | 200 | 500 | add-on |
+| Messages | 2 juta | 5 juta | $2.5/M |
+| Channel | unlimited | unlimited | unlimited |
+
+Presence sync hitung di Messages. User join/leave channel = N sync event ke N subscriber. Channel ramai cepat habis quota.
+
+WebSocket idle pakai connection slot meski tidak ada event. App dengan banyak user passive bisa hit concurrent limit.
+
+### Vector (pgvector)
+
+Tidak ada billing terpisah. Hitung di Database storage + compute:
+
+- Storage: vector 1536-dim = ~6KB/row. 1M vector = ~6 GB.
+- Compute: HNSW index harus muat di RAM untuk query cepat.
+
+Embedding API (OpenAI, Voyage, Cohere) terpisah, billing langsung ke provider.
+
+## Cost yang sering bikin kaget
+
+Pattern yang bikin tagihan jauh dari estimasi:
+
+### 1. Bandwidth egress lebih besar dari yang diprediksi
+
+Image asset yang diakses sering = bandwidth gede. Strategi:
+
+- Pasang `Cache-Control` aggressive di upload.
+- Pakai CDN di depan (Cloudflare, Vercel) untuk asset yang tidak berubah.
+- Image transform on-demand bukan pre-generate banyak ukuran.
+
+### 2. SMS bill terpisah
+
+OTP SMS, MFA SMS, phone verification semua ke provider eksternal. Bisa $1000+/bulan untuk app dengan 10K signup. Strategi:
+
+- Default ke magic link (email free).
+- SMS sebagai fallback untuk yang tidak punya email.
+- Rate limit SMS request per nomor.
+
+### 3. Compute add-on untuk Postgres
+
+Query lambat karena RAM kurang = tergoda upgrade compute. Lebih murah biasanya: tambah index, optimize query, pakai cache (Redis terpisah, atau materialized view).
+
+Compute upgrade saat: index tidak muat RAM (vector HNSW besar), banyak concurrent connection, query analytic yang memang heavy.
+
+### 4. External LLM/AI cost
+
+Edge Function panggil Anthropic / OpenAI = cost terpisah, langsung ke AI provider. Untuk RAG yang query frequent, ini bisa dominan cost dari Supabase sendiri.
+
+Strategi:
+
+- Cache LLM response untuk query identik.
+- Pakai model lebih kecil/murah untuk task simple (Claude Haiku, GPT-4o-mini).
+- Rate limit per user.
+
+### 5. Realtime presence di channel besar
+
+Presence sync = N event ke N user. Channel 1000 user = 1M event sekali join/leave. Strategi:
+
+- Track presence cuma di screen yang user aware.
+- Channel ramai matikan presence, pakai broadcast eksplisit.
+
+### 6. Free tier limit yang gabungan
+
+Egress 5 GB Free dihitung gabungan Storage + Edge Function response + GraphQL + REST. App yang loud di semua dimensi cepat hit limit. Pro plan jauh lebih lega.
+
+## Decision: kapan upgrade Free ke Pro
+
+Indikator yang valid untuk pindah Pro:
+
+- **Project udah live ke user real, tidak boleh pause**. Free auto-pause 7 hari idle. Production = harus Pro.
+- **Mau Branch project per PR**. Branch fitur Pro only.
+- **Backup retention lebih dari 1 hari** untuk recovery yang reasonable.
+- **MAU dekati 50K** atau egress dekati 5 GB.
+- **Custom domain** untuk function atau API.
+- **Email support**, kalau team butuh response time.
+
+Indikator yang bukan trigger Pro:
+
+- "Saya butuh fitur Pro X" tanpa workload nyata. Bisa nunggu sampai workload validasi.
+- Eksplorasi atau demo. Free cukup, project bisa di-resume.
+
+## Decision: kapan upgrade Pro ke Team
+
+- Team member 5+ orang yang butuh akses dengan role berbeda.
+- Compliance requirement (SSO, audit log retention).
+- Multi-organization workspace.
+
+Untuk team kecil (1-4 orang) di Pro, biasanya cukup.
+
+## Decision: kapan upgrade ke Enterprise
+
+- Compliance regulator (HIPAA, PCI, SOC 2 Type II).
+- Workload yang butuh dedicated infrastructure (compliance / performance isolation).
+- Region custom atau on-prem deployment.
+- SLA contract dengan support 24/7.
+
+Solo developer atau startup early-stage hampir tidak pernah butuh Enterprise.
+
+## Estimate cost untuk project typical
+
+### Solo project / MVP
+
+| Item | Estimasi/bulan |
+|---|---|
+| Supabase Free | $0 |
+| Domain | ~$1 |
+| OpenAI/Anthropic API (light usage) | $0-5 |
+| **Total** | $1-6 |
+
+### Production small (1K active user, ringan)
+
+| Item | Estimasi/bulan |
+|---|---|
+| Supabase Pro | $25 |
+| Anthropic Claude Haiku (light AI usage) | $5-20 |
+| SMTP eksternal (Resend, SES) | $0-10 |
+| **Total** | $30-55 |
+
+### Production medium (10K active user, AI-heavy)
+
+| Item | Estimasi/bulan |
+|---|---|
+| Supabase Pro | $25 |
+| Compute add-on (medium) | $60 |
+| Egress over 250 GB (~100 GB extra) | $9 |
+| Anthropic Claude (heavier) | $50-200 |
+| OpenAI embedding | $10-30 |
+| Twilio SMS (kalau MFA) | $50-200 |
+| **Total** | $200-500 |
+
+Untuk skala ini, AI provider cost mendominasi. Cost Supabase relatif stabil $25-100.
+
+## Setelah ini
+
+- Pricing detail per service: cek section "Pricing mental model" di tiap [Service Reference](/id/supabase/services).
+- Compute add-on dan tuning: [Database service](/id/supabase/services/database).
+- SMS dan email provider: [Auth service](/id/supabase/services/auth).
+- AI provider integration: [S4](/id/supabase/journeys/s4-edge-function) dan [S5](/id/supabase/journeys/s5-rag).

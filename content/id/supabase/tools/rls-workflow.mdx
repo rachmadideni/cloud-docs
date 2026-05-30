@@ -1,0 +1,423 @@
+# RLS Workflow
+
+Cara track Row Level Security seperti track migrasi schema: SQL di file, versioned di Git, applied via CLI, test otomatis sebelum push. Halaman ini lima pattern yang sustainable plus anti-pattern yang sering bikin kacau di production.
+
+## Kenapa RLS butuh treatment khusus
+
+RLS itu SQL DDL biasa, tapi tiga karakteristiknya bikin tracking lebih tricky dari migrasi schema biasa:
+
+1. **Tidak ada `ALTER POLICY` yang ubah expression**. Untuk revise policy, kamu drop + recreate. Migrasi style "alter table add column" tidak applicable.
+2. **Failure mode silent**. Schema salah biasanya throw exception saat migrasi atau saat query. Policy salah cuma return data kosong atau yang salah. User tidak ngerasa, sampai audit nemu data bocor atau hilang.
+3. **Test "sebagai user X" tidak native**. `psql` connect sebagai `postgres` role yang bypass RLS. Studio SQL editor juga. Untuk test policy beneran, perlu simulate JWT claim, bukan sekadar set role.
+
+Tiga karakteristik ini kombinasi bikin RLS jadi area paling rawan drift dan paling jarang di-cover test di project Supabase typical. Halaman ini cara handle-nya.
+
+## Pattern 1: Idempotent policy migration
+
+Pakai `drop policy if exists ... create policy ...` di tiap migrasi yang sentuh policy. Tulis migrasi sebagai "state akhir", bukan "diff dari state sebelumnya":
+
+```sql
+-- supabase/migrations/20260530_revise_notes_select_policy.sql
+
+drop policy if exists "users see own notes" on notes;
+
+create policy "users see own notes"
+  on notes for select to authenticated
+  using (
+    (select auth.uid()) = user_id
+    and is_archived = false
+  );
+```
+
+Kenapa bukan style "alter": Postgres tidak ada `alter policy ... using (new expression)`. Yang ada cuma `alter policy ... rename to ...`. Drop + create satu-satunya jalan revise expression atau target role.
+
+Keuntungan idempotent:
+
+- Aman di-apply ulang. Kalau migrasi gagal di tengah lalu retry, tidak conflict.
+- Aman di-test ulang. `supabase db reset` apply migrasi dari nol, policy tetap end state yang benar.
+- Diff Git jelas. Reviewer baca satu file langsung tahu policy final, tidak perlu trace history.
+
+Pattern variasi yang lebih defensive untuk policy banyak:
+
+```sql
+-- Drop semua policy di table sebelum recreate
+do $$
+declare
+  pol record;
+begin
+  for pol in
+    select policyname from pg_policies
+    where tablename = 'notes' and schemaname = 'public'
+  loop
+    execute format('drop policy %I on public.notes', pol.policyname);
+  end loop;
+end $$;
+
+-- Recreate policy state akhir
+create policy "users see own notes" ...
+create policy "users insert own notes" ...
+create policy "users update own notes" ...
+create policy "users delete own notes" ...
+```
+
+Pakai pattern ini kalau revisi besar yang ubah banyak policy sekaligus.
+
+## Pattern 2: Pisah schema vs policy migration
+
+Convention nama file yang bikin maintain lebih sustain:
+
+```
+supabase/migrations/
+  20260501000000_create_notes_table.sql        # CREATE TABLE only
+  20260501000001_create_notes_policies.sql     # CREATE POLICY only
+  20260520000000_revise_notes_select_policy.sql
+  20260601000000_create_comments_table.sql
+  20260601000001_create_comments_policies.sql
+```
+
+File pertama (timestamp lebih awal) bikin table + index + RLS enable. File kedua (timestamp +1) bikin semua policy.
+
+Manfaat:
+
+- **Code review fokus**. PR yang ubah policy ga ke-mix sama PR yang ubah schema. Reviewer fokus per concern.
+- **Frequency mismatch**. Schema stable cepat (jarang berubah setelah launch). Policy sering revise (role baru, kondisi tambahan, fix bug). Pemisahan file mengakui ritme yang beda.
+- **Selective rollback**. Kalau policy revision rusak, revert satu file. Tidak perlu rollback schema yang stable.
+- **History clarity**. `git log -- supabase/migrations/*policies*` langsung kasih timeline evolution policy.
+
+Catatan: dua file di timestamp berurutan (`...000000` dan `...000001`) Supabase CLI accept sebagai migrasi terpisah. Cuma jangan duplicate timestamp persis.
+
+## Pattern 3: Test pakai pgTAP
+
+Supabase CLI bundled support pgTAP. Bikin file di `supabase/tests/database/`, `.sql` extension, Supabase auto pickup.
+
+Pertama, enable pgTAP di lokal (sekali):
+
+```sql
+-- supabase/migrations/00000000000000_enable_pgtap.sql
+create extension if not exists pgtap with schema extensions;
+```
+
+Lalu test file untuk RLS notes:
+
+```sql
+-- supabase/tests/database/notes_rls.test.sql
+
+begin;
+select plan(5);
+
+-- Setup: dua user
+insert into auth.users (id, email) values
+  ('11111111-1111-1111-1111-111111111111', 'a@test.com'),
+  ('22222222-2222-2222-2222-222222222222', 'b@test.com');
+
+insert into notes (user_id, content) values
+  ('11111111-1111-1111-1111-111111111111', 'a punya'),
+  ('22222222-2222-2222-2222-222222222222', 'b punya');
+
+-- Test sebagai user A
+set local role authenticated;
+set local request.jwt.claim.sub to '11111111-1111-1111-1111-111111111111';
+
+select results_eq(
+  'select content from notes order by created_at',
+  array['a punya'],
+  'user A cuma lihat note miliknya'
+);
+
+select throws_ok(
+  $$insert into notes (user_id, content) values ('22222222-2222-2222-2222-222222222222', 'sneak')$$,
+  '42501',
+  'new row violates row-level security policy for table "notes"',
+  'user A tidak bisa insert dengan user_id user B'
+);
+
+select results_eq(
+  $$update notes set content = 'modified' where user_id = '22222222-2222-2222-2222-222222222222' returning content$$,
+  'select null::text where false',
+  'user A update note user B return zero row (bukan error, RLS filter)'
+);
+
+-- Test sebagai user B
+set local request.jwt.claim.sub to '22222222-2222-2222-2222-222222222222';
+
+select results_eq(
+  'select content from notes order by created_at',
+  array['b punya'],
+  'user B cuma lihat note miliknya'
+);
+
+-- Test anon (belum login)
+reset role;
+set local role anon;
+
+select is_empty(
+  'select * from notes',
+  'anon tidak lihat note apapun'
+);
+
+select * from finish();
+rollback;
+```
+
+Jalanin:
+
+```bash
+supabase test db
+```
+
+CLI auto cari file `.test.sql` di `supabase/tests/database/`, jalanin satu-satu, output tap-format. Exit code non-zero kalau ada test fail.
+
+### Kunci dari test ini
+
+Tiga baris ini yang bikin test sebenarnya simulate user login:
+
+```sql
+set local role authenticated;
+set local request.jwt.claim.sub to '<user-id>';
+```
+
+`role authenticated` set Postgres role yang RLS jalan. `request.jwt.claim.sub` set claim subject yang `auth.uid()` baca. Kombinasi ini persis kayak yang dilakukan GoTrue ke Postgres saat user beneran login. Test policy di kondisi ini = test policy di production.
+
+`begin; ... rollback;` di awal/akhir bikin test isolated. Insert data, run assertion, rollback. State DB tidak berubah setelah test.
+
+## Pattern 4: Helper function untuk impersonate
+
+Tulis sekali, pakai di semua test file:
+
+```sql
+-- supabase/migrations/<timestamp>_create_test_helpers.sql
+
+create schema if not exists tests;
+
+create or replace function tests.authenticate_as(user_id uuid)
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('role', 'authenticated', true);
+  perform set_config('request.jwt.claim.sub', user_id::text, true);
+end;
+$$;
+
+create or replace function tests.clear_authentication()
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('role', 'anon', true);
+  perform set_config('request.jwt.claim.sub', '', true);
+end;
+$$;
+```
+
+Pakai di test:
+
+```sql
+select tests.authenticate_as('11111111-1111-1111-1111-111111111111');
+select results_eq('select content from notes', array['a punya'], 'user A scope');
+
+select tests.authenticate_as('22222222-2222-2222-2222-222222222222');
+select results_eq('select content from notes', array['b punya'], 'user B scope');
+
+select tests.clear_authentication();
+select is_empty('select * from notes', 'anon scope');
+```
+
+Lebih readable. Kalau ada kebutuhan tambahan (mis. set custom JWT claim untuk RBAC test), tambahin function helper di schema yang sama:
+
+```sql
+create or replace function tests.authenticate_with_role(user_id uuid, user_role text)
+returns void
+language plpgsql
+as $$
+begin
+  perform set_config('role', 'authenticated', true);
+  perform set_config('request.jwt.claim.sub', user_id::text, true);
+  perform set_config('request.jwt.claim.user_role', user_role, true);
+end;
+$$;
+```
+
+Schema `tests` cuma convention. Tidak di-expose PostgREST (PostgREST default cuma expose `public` + `graphql_public`), jadi aman dari accidental client call.
+
+## Pattern 5: CI gate untuk drift detection
+
+Pipeline yang reasonable:
+
+```yaml
+# .github/workflows/db-check.yml
+name: DB Check
+
+on:
+  pull_request:
+    paths:
+      - 'supabase/**'
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Setup Supabase CLI
+        uses: supabase/setup-cli@v1
+        with:
+          version: latest
+
+      - name: Start local stack
+        run: supabase start
+
+      - name: Apply migrations
+        run: supabase db reset
+
+      - name: Run pgTAP tests
+        run: supabase test db
+
+      - name: Check drift from production
+        if: github.event_name == 'pull_request'
+        env:
+          SUPABASE_ACCESS_TOKEN: $SECRET_ACCESS_TOKEN
+          PROJECT_REF: $SECRET_PROJECT_REF
+        run: |
+          supabase link --project-ref "$PROJECT_REF"
+          diff=$(supabase db diff --linked --schema public)
+          if [ -n "$diff" ]; then
+            echo "::error::Drift detected between migrations and remote DB"
+            echo "$diff"
+            exit 1
+          fi
+```
+
+(Ganti `$SECRET_ACCESS_TOKEN` dan `$SECRET_PROJECT_REF` dengan GitHub Actions secret syntax di repo kamu. Ditulis pakai placeholder di sini untuk hindari konflik render markdown.)
+
+Gate ini lakuin tiga hal kritis:
+
+1. **Apply migrasi fresh**: bikin DB dari nol pakai semua migrasi. Kalau salah satu rusak (mis. forward dependency), build fail.
+2. **Run semua pgTAP test**: policy yang regress ketangkap di sini.
+3. **Drift detection**: `db diff --linked` bandingin migrasi dengan state remote. Kalau seseorang ngedit policy di Studio production, diff output != empty, build fail.
+
+Drift detection paling vital. Tanpa ini, makin lama policy di Git makin out of sync dengan reality di production. Reader hari pertama nge-debug "kenapa migrasi error" baru sadar production udah beda dari sebulan lalu.
+
+### Tambahan: enforce review owner
+
+GitHub CODEOWNERS untuk migrasi policy:
+
+```
+# .github/CODEOWNERS
+/supabase/migrations/*policies*    @security-team @senior-engineers
+```
+
+PR yang touch policy auto-require approval dari role spesifik. Cocok untuk team yang udah agak besar.
+
+## Anti-pattern
+
+### 1. Edit policy langsung di Studio production
+
+Studio adalah tools eksplorasi, bukan tools manajemen schema permanent. Ubah policy di sana =
+
+- Tidak ada history, tidak ada Git commit
+- Tidak ada code review
+- Tidak ada test
+- Drift langsung dari migrasi yang versioned
+
+Solusi: edit policy di lokal, generate migrasi (`supabase migration new` atau `supabase db diff`), test, commit, push. Studio production sebaiknya read-only via team agreement atau IAM kalau available.
+
+### 2. Skip pgTAP karena "udah manual test"
+
+RLS bug paling brutal silent. Query return data kosong, atau worse, return data user lain. Manual test lupa edge case. pgTAP ngejaring:
+
+- Insert dengan foreign user_id (boleh tidak boleh)
+- Update orang lain (return zero row vs error vs success bocor)
+- Anon scope (yang seharusnya nothing)
+- Role mismatch (admin lihat, member tidak)
+
+Setiap RLS pattern butuh paling tidak 4-5 assertion test. Tanpa pgTAP, manusia konsisten test 1-2 lalu lupa.
+
+### 3. Migrasi besar yang gabungin schema + 10 policy
+
+Code review jadi >300 line diff, reviewer skip detail. Rollback jadi all-or-nothing. Pisah satu concern per migrasi: schema change, policy revise, function add, dst.
+
+Aturan informal yang works: tiap file migrasi target ≤100 line. Kalau lebih, pisah.
+
+### 4. Lupa sequencing `enable rls` sebelum policy
+
+```sql
+-- SALAH urutan
+create policy "..." on notes for select ...;
+alter table notes enable row level security;
+-- antara policy create dan enable rls, table accessible tanpa policy
+```
+
+Walau jarang exploit-able karena window pendek, urutan benar:
+
+```sql
+create table notes (...);
+alter table notes enable row level security;
+-- baru policy
+create policy "..." on notes for select ...;
+```
+
+Postgres mengizinkan `create policy` sebelum `enable row level security` (policy ada tapi inactive). Tapi convention semua di repo Supabase official: enable rls dulu, baru policy. Konsisten dengan reasoning least surprise.
+
+### 5. `revoke` yang ketinggalan saat hapus tabel
+
+Kalau drop table yang punya policy, policy auto-drop. Tapi kalau drop policy tanpa drop table, grant `select` yang sebelumnya di-buat untuk role authenticated tetap ada. Edge case ini hampir tidak pernah muncul di project Supabase typical (karena role grant dikelola Supabase) tapi worth aware kalau project punya custom role.
+
+## Tooling beyond CLI native
+
+90% project cukup pakai Supabase CLI + pgTAP. Tooling alternative justify saat project punya kompleksitas tertentu.
+
+| Tool | Kapan justify | Trade-off |
+|---|---|---|
+| [Atlas](https://atlasgo.io) | Multi-environment dengan policy beda, declarative schema as code | Belajar DSL baru, integrasi dengan Supabase CLI manual |
+| [sqitch](https://sqitch.org) | Migrasi punya dependency complex antar object (function depend on table depend on enum), bukan linear | Lebih powerful tapi overhead config tinggi |
+| [dbmate](https://github.com/amacneil/dbmate) | Multi-DB project (Postgres + MySQL + SQLite) | Tidak Postgres-specific, fitur RLS tidak special-cased |
+| [pgroll](https://github.com/xataio/pgroll) | Zero-downtime migrasi besar di production live | Overhead besar untuk project kecil |
+
+Untuk project Supabase typical: skip dulu. Pertimbangkan kalau kamu udah ngerasa Supabase CLI kurang.
+
+## Adoption guide
+
+Tidak harus sekaligus. Bertahap based on lifecycle project:
+
+### Project baru / MVP
+
+Minimum yang sustainable:
+
+- Pattern 1: idempotent migration (drop + create)
+- Pattern 3: pgTAP test untuk setiap policy yang ditulis
+
+Dua ini sudah cover 80% kasus drift dan regression.
+
+### Project mau go production
+
+Tambah:
+
+- Pattern 2: pisah file schema vs policy (refactor migrasi yang udah ada)
+- Pattern 4: helper `tests.authenticate_as()`
+
+Pisah file kerjain refactor di satu PR. Helper ditulis sekali jadi infra test.
+
+### Project udah live dengan multi-engineer
+
+Wajib:
+
+- Pattern 5: CI gate dengan drift detection
+- Studio production read-only (via team agreement atau IAM)
+- CODEOWNERS untuk migrasi policy
+
+Pattern 5 paling krusial. Tanpa drift detection, makin lama branch makin nyimpang dari production reality.
+
+### Team gede / compliance regulated
+
+Pertimbangkan:
+
+- Atlas atau pgroll untuk schema management formal
+- Audit log policy change via `pgaudit`
+- Periodic policy review (mis. quarterly)
+
+## Setelah ini
+
+- Pattern RLS yang dipakai pattern di atas: [Database service](/id/supabase/services/database#rls-pattern-library)
+- End-to-end journey pakai pattern 1 + 3: [S1 Auth + CRUD](/id/supabase/journeys/s1-auth-crud)
+- Workflow CLI general (migrasi, types, function): [Workflow](/id/supabase/tools/workflow)
